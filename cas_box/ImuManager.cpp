@@ -7,6 +7,13 @@ static const uint8_t kBnoAddr = 0x28;
 static const uint32_t kUpdatePeriodMs = 100;
 static const uint16_t kNorthAlignMs = 3000;
 
+// CHANGED 2026-10-22 (log_004): with the magnetometer uncalibrated (cal 0 for the whole run) the
+// NDOF heading did not follow the rover's turns (GPS course 91 -> 146 deg, heading stayed 336-343).
+// false = IMUPLUS mode: gyro + accelerometer only. Yaw then starts at 0 at power-on (= relative,
+// NOT magnetic north) but follows every turn reliably. GpsNav learns true north from GPS anyway.
+// true  = original behaviour (NDOF with magnetometer, yaw 0 = magnetic north).
+static const bool kUseMagnetometer = false;
+
 static Adafruit_BNO055 bno(55, kBnoAddr, &Wire);
 
 // Wraps an angle to -180..180 degrees.
@@ -31,9 +38,17 @@ static bool magneticHeadingDeg(float rollDeg, float pitchDeg, float& headingDeg)
 bool ImuManager::begin() {
   if (!bno.begin()) return false;
   bno.setExtCrystalUse(true);
-  bno.setMode(OPERATION_MODE_NDOF);
-  _ready = true;
-  _alignNorth(kNorthAlignMs);
+  if (kUseMagnetometer) {
+    bno.setMode(OPERATION_MODE_NDOF);
+    _ready = true;
+    _alignNorth(kNorthAlignMs);
+  } else {
+    bno.setMode(OPERATION_MODE_IMUPLUS);  // gyro + accel fusion, relative heading
+    _ready = true;
+    _northAnchored = true;                // yaw = fusion heading, 0 = direction at power-on
+    _northOffsetDeg = 0;
+    Serial.println("[imu] IMUPLUS mode (no magnetometer): yaw is relative to the start");
+  }
   return true;
 }
 
@@ -48,7 +63,7 @@ void ImuManager::update() {
   const float sensorRoll = e.y(), sensorPitch = e.z();
   _fusionYawDeg = wrap180(e.x());
   float h;
-  if (magneticHeadingDeg(sensorRoll, sensorPitch, h)) _magYawDeg = h;  // tilt comp. in sensor frame
+  if (kUseMagnetometer && magneticHeadingDeg(sensorRoll, sensorPitch, h)) _magYawDeg = h;  // tilt comp.
 
   // sensor frame -> vehicle frame (ISO 8855), see header: sensor turned by 90 deg
   _pitchDeg = -sensorRoll;   // front down = sensor roll negative  -> ISO pitch positive

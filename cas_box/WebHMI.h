@@ -35,6 +35,10 @@ public:
 
   void tick();  // call once per loop pass (measures the loop time for the "Dev" view)
 
+  // Added for DriveLog: the server, so other modules can add their own routes.
+  // Valid after begin() (nullptr before).
+  AsyncWebServer* server() const { return _server; }
+
 private:
   struct Value {
     char name[24];

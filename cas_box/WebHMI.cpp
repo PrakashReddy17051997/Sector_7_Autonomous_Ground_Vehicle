@@ -141,7 +141,7 @@ async function poll(){
   }catch(e){$('conn').textContent='Offline';}
 }
 setInterval(poll,250);poll();
-</script></body></html>)rawpage";
+</script><script src='/log.js'></script></body></html>)rawpage";
 
 // Appends s to out as JSON string content (quotes and backslashes escaped, control chars dropped).
 static void jsonEscape(String& out, const char* s) {

@@ -26,6 +26,22 @@ public:
   // i: 0 front, 1 left, 2 right, 3 back, 4 front angled
   int usCm(uint8_t i) const { return i < 5 ? _usCm[i] : kUsMaxCm; }
 
+  // ---- added for DriveLog / SafetyGuard / navigation: read-only access to the snapshot
+  //      (all values are updated 4 times per second in update())
+  // LiDAR point i (0 = front, clockwise, 4 deg each) in cm, 0 = no reliable return
+  uint16_t lidarCm(uint8_t i) const { return i < kLidarPoints ? _lidarCm[i] : 0; }
+  bool lidarOk() const { return _lidarOk; }
+  bool imuOk() const { return _imuReady; }
+  float yawDeg() const { return _yaw; }      // ISO 8855: + = turning left, 0 = magnetic north
+  float pitchDeg() const { return _pitch; }  // + = front down
+  float rollDeg() const { return _roll; }    // + = right side down
+  uint8_t magCal() const { return _cal[3]; } // magnetometer calibration 0..3
+  bool gpsFix() const { return _gpsFix; }
+  double lat() const { return _lat; }        // last valid fix, degrees
+  double lon() const { return _lon; }
+  int sats() const { return _sats; }
+  float hdop() const { return _hdop; }
+
 private:
   void _snapshotLidar();
   void _snapshotGps();

@@ -1,6 +1,7 @@
 // =============================================================================================
 //  CAS Box - starter program for the sensor box on the WAVE ROVER
 //  Case Study Cooperative and Autonomous Systems, version 1.0 (2026-10-15)
+//  + DriveLog (drive recording to flash) and SafetyGuard (emergency stop layer), 2026-10-22
 // =============================================================================================
 //
 //  WHAT IT DOES
@@ -11,6 +12,8 @@
 //
 //    Web page: drive pad (hold a key = drive, release = stop), speed slider, LiDAR top view,
 //    ultrasonic distances, IMU (roll/pitch/yaw), GPS. "Dev" (top right) shows raw values.
+//    NEW: "Drive log" card below the drive pad (Start / Stop / Mark / download), and the drive
+//    command passes through SafetyGuard before it goes to the rover (see SafetyGuard.h).
 //
 //  BEFORE YOU FLASH: set BOX_ID below to the number of your kit (sticker on box and rover).
 //    Everything else follows from it - do not change the naming scheme:
@@ -24,7 +27,8 @@
 //  START ORDER: switch on the box first, then the rover (the rover looks for its box only
 //    while it boots). Phone: join CAS-Box-<NN>, open the web page.
 //
-//  ARDUINO IDE: board "ESP32 Dev Module", ESP32 core 3.3.x, default partition scheme.
+//  ARDUINO IDE: board "ESP32 Dev Module", ESP32 core 3.3.x, default partition scheme
+//    (the default scheme is needed: it holds the ~1.3 MB log storage).
 //    Required libraries and versions: README.md. Serial monitor: 115200 baud.
 //
 //  FILES
@@ -37,6 +41,8 @@
 //    ImuManager.*       orientation sensor BNO055 (roll / pitch / yaw in the ISO 8855 vehicle frame)
 //    GpsManager.*       GPS module NEO-6M
 //    DisplayManager.*   small OLED on the box
+//    DriveLog.*         NEW: records drives to flash, web card, download (decode: analyze_log.py)
+//    SafetyGuard.h      NEW: tilt / ultrasonic / LiDAR stop on every drive command
 //
 //  SAFETY / BEHAVIOUR
 //    The rover stops when you release the key, when the page loses focus, when the box gets no
@@ -49,22 +55,39 @@
 #include "RoverLink.h"
 #include "Sensors.h"
 #include "DisplayManager.h"
+#include "DriveLog.h"
+#include "SafetyGuard.h"
+#include "GpsNav.h"
+#include "WallFollow.h"
+#include "Mission.h"
+#include "MotorShaper.h"
+#include "PageUi.h"
+#include <esp_wifi.h>
 
 // ---- YOUR KIT ------------------------------------------------------------------------------
-const int BOX_ID = 10;                     // 1..10 = kit number on the box
+const int BOX_ID = 7;                      // 1..10 = kit number on the box
 
 // ---- settings --------------------------------------------------------------------------------
 const float MAX_SPEED = 0.5f;             // drive pad maximum; 0.5 = full rover speed (100 % PWM)
 const uint32_t PAD_TIMEOUT_MS = 400;      // no update from the phone for this long -> stop
 const int LIDAR_OFFSET_DEG = 90;          // rotates the LiDAR view so that "front" is up
+const bool USE_SAFETY_GUARD = true;       // false = drive commands go to the rover unchanged
 
 // ---- objects ---------------------------------------------------------------------------------
 WebHMI hmi;           // web server + page
 RoverLink rover;      // connection to the rover
 Sensors sensors;      // all box sensors
 DisplayManager disp;  // small OLED on the box
+DriveLog logger;      // drive recording to flash (web card "Drive log")
+SafetyGuard guard;    // emergency stop layer, thresholds in guard.cfg
+GpsNav nav;           // autonomous GPS waypoint mode (web card "Autonomous (GPS)")
+WallFollow wall;      // autonomous LiDAR wall following (web card "Wall following")
+Mission mission;      // full-auto run: route B -> H leg by leg (RouteFollow, teach & repeat of log_009)
+MotorShaper shaper;   // dead band / pivot / breakaway compensation (the rover needs ~0.5 to start turning)
 bool oledReady = false;
 char boxSsid[16], boxPassword[16];
+uint8_t safetyReason = SafetyGuard::OK;  // last guard decision, for the page
+String resetReason;   // why the box started (see /boot.txt)
 
 // OLED: Wi-Fi name, web address, rover state. Started only when the display answers on I2C.
 void updateOled() {
@@ -94,6 +117,31 @@ void setup() {
   hmi.setStateText("Starting ...");
   hmi.begin(boxSsid, boxPassword, IPAddress(192, 168, 10 + BOX_ID, 1), channel);
 
+  // Less delay box -> rover (log_004): the rover's Wi-Fi sleeps between beacons and only wakes
+  // every DTIM beacons to fetch data. DTIM 1 = it wakes at every beacon (100 ms instead of 200 ms).
+  wifi_config_t apCfg;
+  if (esp_wifi_get_config(WIFI_IF_AP, &apCfg) == ESP_OK) {
+    apCfg.ap.dtim_period = 1;
+    esp_wifi_set_config(WIFI_IF_AP, &apCfg);
+  }
+  WiFi.setTxPower(WIFI_POWER_19_5dBm);  // full transmit power (box is inside a closed case)
+
+  // Drive log: mounts the flash file system and adds its web routes (/log.js, /log/...).
+  // The very first boot formats the storage once (a few seconds).
+  logger.begin(hmi.server());
+  resetReason = logBootReason();   // needs the file system from logger.begin()
+  registerPageUi(hmi.server());    // combined sensor table, /boot.txt
+  nav.begin(hmi.server());     // loads the B->H route from log_003
+  wall.begin(hmi.server());
+  mission.begin(hmi.server());
+
+  // Safety thresholds - change here if needed (defaults: see SafetyGuard.h)
+  // log_002 (2026-10-22): the front-angled ultrasonic looks at the floor (reads ~17 cm on flat
+  // ground) and blocked 64 % of all forward commands -> stop-go jerking. Off for obstacle stops;
+  // it stays in the log as a candidate cliff sensor (reading jumps up at an edge).
+  guard.cfg.useFrontAngled = false;
+  // guard.cfg.frontStopCm = 25;
+
   sensors.begin(LIDAR_OFFSET_DEG);
   rover.begin(100);  // sends the current drive command every 100 ms
 }
@@ -110,8 +158,34 @@ void loop() {
   float l, r;
   uint32_t age;
   hmi.getDrive(l, r, age);
+  const float padL = l, padR = r;       // raw pad command (GpsNav needs it as dead-man switch)
   if (age > PAD_TIMEOUT_MS) l = r = 0;  // key released, page closed or phone gone
-  rover.setDrive(l, r);
+
+  // Full-auto mission (heartbeat from the page) - otherwise manual driving from the pad.
+  mission.pollRequests(sensors, wall, nav);
+  if (mission.active()) mission.steer(sensors, wall, nav, padL, padR, age, l, r);
+
+  const float cmdL = l, cmdR = r;       // what was asked for (logged)
+  safetyReason = USE_SAFETY_GUARD ? guard.apply(sensors, l, r) : (uint8_t)SafetyGuard::OK;
+
+  // make small commands move the rover (dead band, pivot minimum, breakaway kick); no kick while
+  // the guard limits for tilt (slow careful reversing)
+  shaper.apply(l, r, safetyReason != SafetyGuard::TILT);
+
+  rover.setDrive(l, r);                 // every loop pass, after guard and shaper
+  mission.feedOutput(l, r);             // route progress = what really went to the rover
+
+  // ---- drive log (records 4x per second while "Start" is active) -----------------------------
+  DriveLog::Sample smp;
+  smp.cmdL = cmdL;
+  smp.cmdR = cmdR;
+  smp.outL = l;
+  smp.outR = r;
+  smp.safety = safetyReason;
+  smp.batteryV = rover.voltage();
+  smp.rttMs = rover.rttMs();             // box -> rover command delay (log_004: "lag")
+  smp.navByte = mission.logByte();       // route leg + state (in the mag_cal byte, see DriveLog.h)
+  logger.update(sensors, smp);
 
   // ---- web page and OLED -----------------------------------------------------------------------
   uint32_t now = millis();
@@ -122,13 +196,25 @@ void loop() {
   }
   if (now - lastUi >= 500) {  // status line + values in the "Dev" view
     lastUi = now;
-    hmi.setStateText(rover.statusText());
+    String state = rover.statusText();
+    if (safetyReason != SafetyGuard::OK) state = String(SafetyGuard::reasonText(safetyReason)) + " | " + state;
+    if (mission.active()) state = "MISSION " + mission.statusText() + " | " + state;
+    if (millis() < 120000 && resetReason != "power on" && !resetReason.startsWith("reset button"))
+      state = "BOX RESTARTED: " + resetReason + " | " + state;   // first 2 minutes after a reset
+    if (logger.active()) state = "● REC | " + state;
+    hmi.setStateText(state);
     hmi.showValue("rover.ip", rover.ip().toString());
     hmi.showValue("rover.voltage_V", rover.voltage());
     hmi.showValue("rover.rtt_ms", rover.rttMs());
     hmi.showValue("rover.ok", (double)rover.okCount());
     hmi.showValue("rover.fail", (double)rover.failCount());
     hmi.showValue("sys.heap_kB", ESP.getFreeHeap() / 1024.0);
+    hmi.showValue("safety", String(SafetyGuard::reasonText(safetyReason)));
+    hmi.showValue("log", logger.statusText());
+    hmi.showValue("sys.reset", resetReason);
+    hmi.showValue("mission", mission.statusText());
+    hmi.showValue("route", String(mission.route.legIndex() + 1) + " " + mission.route.msg() + " eff " +
+                           String(mission.route.effortFrac() * 100.0f, 0) + "%");
   }
   if (now - lastOled >= 1000) {
     lastOled = now;
@@ -141,9 +227,10 @@ void loop() {
   uint32_t dt = micros() - t0;
   n++; sumUs += dt; if (dt > maxUs) maxUs = dt;
   if (now - lastRep >= 10000) {
-    Serial.printf("[sys] loop avg %.2f ms max %.1f ms, heap %u kB, rover %s\n",
-                  sumUs / 1000.0 / n, maxUs / 1000.0, ESP.getFreeHeap() / 1024,
-                  rover.connected() ? "ok" : "searching");
+    Serial.printf("[sys] loop avg %.2f ms max %.1f ms, heap %u kB (min %u kB), rover %s, %s\n",
+                  sumUs / 1000.0 / n, maxUs / 1000.0, (unsigned)(ESP.getFreeHeap() / 1024),
+                  (unsigned)(ESP.getMinFreeHeap() / 1024),
+                  rover.connected() ? "ok" : "searching", logger.statusText().c_str());
     Serial.printf("[sys] %s\n", sensors.toJson().c_str());
     lastRep = now; n = 0; sumUs = 0; maxUs = 0;
   }
