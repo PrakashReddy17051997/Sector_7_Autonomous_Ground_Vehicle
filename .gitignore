@@ -1,5 +1,5 @@
 .DS_Store
 __pycache__/
-INTEGRATIION.md
+cas_box/INTEGRATION.md
 *.pyc
 build/
