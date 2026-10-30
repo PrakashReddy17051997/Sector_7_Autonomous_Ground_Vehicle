@@ -6,7 +6,9 @@
 // All network I/O runs in an own FreeRTOS task on core 0, so loop() never waits for the rover.
 //
 //   rover.begin();
-//   rover.setDrive(l, r);  // call every loop pass; the task sends it every 100 ms ("T":1)
+//   rover.setDrive(l, r);  // call every loop pass; the task sends it every 100 ms ("T":1), and
+//                          // AT ONCE when the command changes (2026-10-29: a new command used to
+//                          // wait up to 100 ms for the next slot; min. kMinGapMs between commands)
 //
 // When l = r = 0 the task sends stops until the rover confirmed three of them, then every
 // 500 ms alternately repeats the stop and polls the rover status ("T":130, battery voltage).
@@ -45,4 +47,6 @@ private:
   volatile float _voltage = 0, _rttMs = 0;
   volatile uint32_t _ok = 0, _fail = 0;
   uint8_t _failRow = 0;  // task only
+  TaskHandle_t _taskHandle = nullptr;
+  float _lastL = 0, _lastR = 0;          // loop() side: last set point (change detection)
 };

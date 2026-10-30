@@ -5,6 +5,15 @@ Usage:
     python3 make_legs.py log_009.csv            # CSV written by analyze_log.py
     python3 make_legs.py log_009.csv --check    # also replays the end-of-leg detectors on the log
 
+WHICH LEGS: if the log has Mark TAGS (log version 2, DriveLog.h), the legs come from the tags: every
+tagged Mark (not "note", not cancelled by "Undo") ends one leg; the tag says how the leg was driven
+(left wall / right wall / heading) and which feature ends it. Logs without tags (log_009) use the
+hand-written PLAN below. Tag -> end of the leg on the box:
+    wall ends (side)        END_LOST    (if the side differs from the followed wall: EFFORT + warning)
+    wall starts (side)      END_FOUND_L/R, endArg = wall distance measured at the press + 0.3 m
+    wall/object ahead       END_FRONT,  endArg = free length ahead measured at the press + 0.5 m
+    ramp, object beside, corner, open area
+                            END_EFFORT  (the LiDAR end scan in RouteMap.h does the real check)
 The PLAN below says which Mark segments form one leg and how the leg is tracked / ended. For each
 leg the script measures from the log (gyro frame of the teaching run = "route yaw"):
     ref     wall direction (yaw + wall angle) for WALL legs, median yaw for HOLD legs
@@ -22,6 +31,7 @@ import numpy as np
 import pandas as pd
 
 sys.path.insert(0, str(Path(__file__).parent))
+import marktags as mt  # noqa: E402
 import navlib as nl  # noqa: E402
 
 # kind: WALL (follow wall on side), HOLD (keep heading). end: LOST (wall of the leg side ends),
@@ -72,17 +82,87 @@ def wrap(x):
     return (x + 180) % 360 - 180
 
 
-def build(A, S):
+MIN_LEG_EFFORT = 2.0   # ~1.5-4 m (depends on the rover): a tagged leg shorter than this is merged into the next one (double press,
+                       # several "corner" tags in a few seconds - every leg end is a turn + a detection)
+GATE = {"LOST": 0.75, "FOUND_L": 0.75, "FOUND_R": 0.75, "FRONT": 0.90, "EFFORT": 0.75}
+
+
+def has_tags(A):
+    return "mark_tag" in A.columns and (A.mark_tag.values != 0).any()
+
+
+def plan_from_tags(A, S, Ld, Rd, verbose=True):
+    """PLAN rows from the Mark tags: every tagged press (not note / start) ends one leg."""
+    P = mt.presses(A.mark.values, A.mark_tag.values)
+    plan, prev = [], 0
+    for i, m, t in P:
+        f, sd, drv = mt.split(t)
+        if f == mt.START:
+            prev = m
+            continue
+        if f == mt.NOTE:
+            continue
+        kind = "WALL" if drv in (1, 2) else "HOLD"
+        side = "R" if drv == 2 or (drv != 1 and sd == 2) else "L"
+        fside = {1: "L", 2: "R"}.get(sd)
+        arg, end, warn = 0.0, "EFFORT", ""
+        if f == 1:                                   # wall ends
+            if fside is None or fside == side or kind == "HOLD":
+                end, side = "LOST", (fside or side)
+            else:
+                warn = f"wall ends {fside} but the leg follows the {side} wall -> EFFORT"
+        elif f == 2 and fside:                       # wall starts
+            dd = (Ld if fside == "L" else Rd)[i]
+            arg = round(float(dd) + 0.3, 2) if dd == dd else 1.0
+            end = "FOUND_" + fside
+        elif f == 3 or (f == 2 and sd == 3):         # wall / object ahead ("wall starts ahead" too)
+            fr = nl.corridor(S[i], 0, look=3.0, minr=0.25)
+            if sd in (1, 2):
+                warn = "wall/object tagged left/right, not ahead -> EFFORT"
+            elif fr >= 2.9:
+                warn = "wall/object ahead tagged, but nothing within 3 m ahead at the press -> EFFORT"
+            else:
+                arg = round(min(2.8, fr + 0.5), 2)
+                end = "FRONT"
+        name = f"{mt.DRIVE[drv] or 'heading'}: {mt.text(t & 0x3F)}"   # "M<start>-M<end>" added in build
+        if m - 1 < prev:
+            continue
+        sel = (A.mark.values >= prev) & (A.mark.values <= m - 1)
+        eff = float(A.vf.values[sel].sum() * 0.25)
+        if eff < MIN_LEG_EFFORT:
+            if verbose:
+                print(f"// mark {m} ({mt.text(t)}): only {eff:.1f} effort since the last leg end -> merged "
+                      f"into the next leg", file=sys.stderr)
+            continue                                  # prev stays: this stretch belongs to the next leg
+        plan.append((name, (prev, m - 1), kind, side, end, arg, 0, 0, GATE[end]))
+        if verbose and warn:
+            print(f"// leg {len(plan)} (mark {m}): {warn}", file=sys.stderr)
+        prev = m
+    if verbose:
+        print(f"// {len(plan)} legs from {len(P)} mark tags", file=sys.stderr)
+    return plan
+
+
+def build(A, S, merge=True):
     Ld, La = wall_features(S, -1)
     Rd, Ra = wall_features(S, 1)
     legs = []
-    for name, (m0, m1), kind, side, end, arg, noRight, gpsA, gate in PLAN:
+    plan = plan_from_tags(A, S, Ld, Rd) if has_tags(A) else PLAN
+    for name, (m0, m1), kind, side, end, arg, noRight, gpsA, gate in plan:
         idx = np.where((A.mark >= m0) & (A.mark <= m1))[0]
+        if len(idx) < 4:
+            print(f"// skipped '{name}': marks {m0}-{m1} have no records", file=sys.stderr)
+            continue
         yaw = A.yaw.values[idx]
         if kind == "WALL":
             dd, aa = (Ld, La) if side == "L" else (Rd, Ra)
             wy = yaw + aa[idx] if side == "L" else yaw - aa[idx]
             ok = ~np.isnan(wy)
+            if ok.mean() < 0.3:   # the LiDAR saw that wall in < 30 % of the leg: cannot follow it
+                print(f"// '{name}': {side} wall seen in only {100 * ok.mean():.0f} % of the leg -> HOLD",
+                      file=sys.stderr)
+                kind = "HOLD"
+        if kind == "WALL":
             ref = float(np.median(wy[ok]))
             dset = float(np.median(dd[idx][ok]))
         else:
@@ -91,16 +171,55 @@ def build(A, S):
         # the leg starts where the yaw first comes within 20 deg of ref (previous turn finished)
         # and ends where it last is within 20 deg (next turn starts)
         near = np.where(np.abs(wrap(yaw - ref)) < 20)[0]
+        if len(near) < 4:         # zig-zag / turning the whole time: take the whole stretch
+            print(f"// '{name}': heading never steady near {ref:.0f} deg -> whole stretch used", file=sys.stderr)
+            near = np.arange(len(idx))
         i0, i1 = idx[near[0]], idx[near[-1]]
         eff = float(A.vf.values[i0:i1 + 1].sum() * 0.25)
         g = A.iloc[i0:i1 + 1]
         gd = math.hypot(g.east_m.iloc[-1] - g.east_m.iloc[0], g.north_m.iloc[-1] - g.north_m.iloc[0])
         blind = gd < 0.25 * eff  # GPS hardly moved although the rover drove: GPS blind zone
-        legs.append(dict(name=name, kind=kind, side=side, end=end, arg=arg, ref=ref, dset=dset,
+        if plan is not PLAN:          # tagged: name = start and end mark of the leg + how it ends
+            name = f"M{max(m0, 1)}-M{m1 + 1} {name}"[:40]
+        legs.append(dict(mk0=max(m0, 1), mk1=m1 + 1, label=name, name=name, kind=kind, side=side, end=end, arg=arg, ref=ref, dset=dset,
                          eff=eff, i0=i0, i1=i1, t0=A.t_s.values[i0], t1=A.t_s.values[i1],
                          lat=A.lat.values[i1], lon=A.lon.values[i1], blind=blind, gpsd=gd,
                          noRight=noRight, gpsA=gpsA, gate=gate))
+    if merge:
+        legs = merge_legs(legs, A)
     return legs, (Ld, La, Rd, Ra)
+
+
+MERGE_DEG = 12.0   # merge a leg without landmark into the next one if both point within this
+
+
+def merge_legs(legs, A):
+    """A leg that ends by EFFORT only (no landmark) and has nearly the same direction and kind as the
+    next one is not a real segment end (log_013: 6 short 'open area' legs on the ramp) - merge it
+    into the next leg. Fewer leg ends = fewer turns and fewer places where the effort can be off."""
+    out = []
+    for L in legs:
+        if out:
+            P = out[-1]
+            same = P["kind"] == L["kind"] and (L["kind"] == "HOLD" or P["side"] == L["side"])
+            if P["end"] == "EFFORT" and same and abs(wrap(P["ref"] - L["ref"])) < MERGE_DEG:
+                w = P["eff"] + L["eff"]
+                ref = P["ref"] + wrap(L["ref"] - P["ref"]) * (L["eff"] / max(w, 1e-6))
+                M = dict(L)
+                if "mk0" in P and "mk1" in L and "label" in L:
+                    lab = L["label"].split(" ", 1)[1] if L["label"].startswith("M") else L["label"]
+                    M["mk0"] = P["mk0"]
+                    M["name"] = M["label"] = f"M{P['mk0']}-M{L['mk1']} {lab}"[:40]
+                M.update(ref=ref, i0=P["i0"], t0=P["t0"], eff=float(A.vf.values[P["i0"]:L["i1"] + 1].sum() * 0.25),
+                         dset=(P["dset"] * P["eff"] + L["dset"] * L["eff"]) / max(w, 1e-6) if L["kind"] == "WALL" else 0.0,
+                         gpsd=P["gpsd"] + L["gpsd"], blind=P["blind"] and L["blind"],
+                         noRight=max(P["noRight"], L["noRight"]))
+                print(f"// merged '{P['name']}' into '{L['name']}' (directions {P['ref']:.0f} / {L['ref']:.0f} deg, "
+                      f"no landmark between)", file=sys.stderr)
+                out[-1] = M
+                continue
+        out.append(L)
+    return out
 
 
 def print_table(legs, src):

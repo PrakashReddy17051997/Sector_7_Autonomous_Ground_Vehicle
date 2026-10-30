@@ -65,7 +65,7 @@
 #include <esp_wifi.h>
 
 // ---- YOUR KIT ------------------------------------------------------------------------------
-const int BOX_ID = 7;                      // 1..10 = kit number on the box
+const int BOX_ID = 4;                      // 1..10 = kit number on the box
 
 // ---- settings --------------------------------------------------------------------------------
 const float MAX_SPEED = 0.5f;             // drive pad maximum; 0.5 = full rover speed (100 % PWM)
@@ -166,14 +166,25 @@ void loop() {
   if (mission.active()) mission.steer(sensors, wall, nav, padL, padR, age, l, r);
 
   const float cmdL = l, cmdR = r;       // what was asked for (logged)
+  // ramp legs of the route: the LiDAR sees the ramp surface as a wall -> LiDAR stop off there
+  // (front ultrasonic 25 cm and tilt stay on), see RouteFollow::rampLegs
+  guard.cfg.lidarStopCm = mission.route.onRamp() ? 0 : 30;
+  // log_018: at the ramp foot the front ultrasonic read 9-23 cm (the ramp surface) -> stop / kick /
+  // stop. On ramp legs it stops only for something really close.
+  guard.cfg.frontStopCm = mission.route.onRamp() ? 10 : 25;
   safetyReason = USE_SAFETY_GUARD ? guard.apply(sensors, l, r) : (uint8_t)SafetyGuard::OK;
 
   // make small commands move the rover (dead band, pivot minimum, breakaway kick); no kick while
   // the guard limits for tilt (slow careful reversing)
+  shaper.setBattery(rover.voltage());   // battery compensation (MotorShaper: full pack -> smaller cmds)
+  shaper.setPitch(sensors.pitchDeg());  // slope: less forward output downhill, a bit more uphill
+  shaper.boost = mission.active() ? mission.route.boost() : 0.0f;   // no progress on rough ground: more
   shaper.apply(l, r, safetyReason != SafetyGuard::TILT);
 
   rover.setDrive(l, r);                 // every loop pass, after guard and shaper
-  mission.feedOutput(l, r);             // route progress = what really went to the rover
+  // route progress = what really went to the rover, as the command it equals at 11.6 V (so the
+  // effort per metre does not change with the battery)
+  mission.feedOutput(l * shaper.equivalent(), r * shaper.equivalent());
 
   // ---- drive log (records 4x per second while "Start" is active) -----------------------------
   DriveLog::Sample smp;
@@ -185,6 +196,19 @@ void loop() {
   smp.batteryV = rover.voltage();
   smp.rttMs = rover.rttMs();             // box -> rover command delay (log_004: "lag")
   smp.navByte = mission.logByte();       // route leg + state (in the mag_cal byte, see DriveLog.h)
+  smp.navLeg = mission.logLeg();         // full leg number (the byte above holds only legs 1..15)
+  if (mission.active()) {                // v3 debug: who drove, what the route code believed
+    const RouteFollow& rt = mission.route;
+    const uint8_t w = rt.why();
+    smp.dbg = (w == RouteFollow::WHY_TAP ? 1 : 0) | (w == RouteFollow::WHY_SETTLE ? 2 : 0) |
+              (shaper.kicking() ? 4 : 0) | (w == RouteFollow::WHY_STEP ? 8 : 0) | (rt.pathLocked() ? 16 : 0);
+    smp.ctrlDeg = rt.ctrlErrDeg();
+    if (rt.pathOn()) {
+      const LocalLocalizer& P = rt.local();
+      smp.lpX = P.x(); smp.lpY = P.y(); smp.lpThDeg = P.th() * RAD_TO_DEG; smp.lpScore = P.score();
+      smp.carrotDeg = P.headingErrorToWaypoint(rt.pathLookM) * RAD_TO_DEG;
+    }
+  }
   logger.update(sensors, smp);
 
   // ---- web page and OLED -----------------------------------------------------------------------
@@ -205,6 +229,10 @@ void loop() {
     hmi.setStateText(state);
     hmi.showValue("rover.ip", rover.ip().toString());
     hmi.showValue("rover.voltage_V", rover.voltage());
+    hmi.showValue("motor.vscale", String(shaper.vScale(), 3) + (shaper.vComp ? "" : " (off)"));
+    hmi.showValue("motor.slope", String(shaper.slopeFactor(), 2) + " / boost " + String(shaper.boost, 2));
+    hmi.showValue("route.tap", String(mission.route.tapGain(), 0) + " deg/s, drift " +
+                  String(mission.route.driftDegS(), 1) + " deg/s, progress " + String(mission.route.progressCm(), 1) + " cm");
     hmi.showValue("rover.rtt_ms", rover.rttMs());
     hmi.showValue("rover.ok", (double)rover.okCount());
     hmi.showValue("rover.fail", (double)rover.failCount());

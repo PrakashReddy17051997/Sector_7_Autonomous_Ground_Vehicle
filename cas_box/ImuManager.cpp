@@ -4,7 +4,7 @@
 #include <Adafruit_BNO055.h>
 
 static const uint8_t kBnoAddr = 0x28;
-static const uint32_t kUpdatePeriodMs = 100;
+static const uint32_t kUpdatePeriodMs = 20;   // 50 Hz (was 100 ms): RouteFollow steers on the live yaw
 static const uint16_t kNorthAlignMs = 3000;
 
 // CHANGED 2026-10-22 (log_004): with the magnetometer uncalibrated (cal 0 for the whole run) the
@@ -68,7 +68,8 @@ void ImuManager::update() {
   // sensor frame -> vehicle frame (ISO 8855), see header: sensor turned by 90 deg
   _pitchDeg = -sensorRoll;   // front down = sensor roll negative  -> ISO pitch positive
   _rollDeg = -sensorPitch;   // right down = sensor pitch negative -> ISO roll positive
-  bno.getCalibration(&_cal[0], &_cal[1], &_cal[2], &_cal[3]);
+  static uint8_t calN = 0;
+  if (++calN >= 10) { calN = 0; bno.getCalibration(&_cal[0], &_cal[1], &_cal[2], &_cal[3]); }  // 5 Hz is plenty
 }
 
 float ImuManager::yawDeg() const {

@@ -9,6 +9,7 @@ static const uint8_t kLostAfterFails = 10;   // consecutive failures -> search t
 static const uint32_t kDeadmanMs = 500;      // set point older than this -> stop
 static const uint32_t kSearchEveryMs = 2000;
 static const uint32_t kIdleEveryMs = 500;    // idle: stop or status poll, alternately
+static const uint32_t kMinGapMs = 30;        // changed command: send at once, but not more often
 
 // Percent-encodes everything except unreserved URL characters (the JSON goes into a query string).
 static String urlEncode(const String& s) {
@@ -29,7 +30,7 @@ static String urlEncode(const String& s) {
 
 void RoverLink::begin(uint32_t periodMs) {
   _periodMs = periodMs;
-  xTaskCreatePinnedToCore(_taskEntry, "roverLink", 6144, this, 1, nullptr, 0);
+  xTaskCreatePinnedToCore(_taskEntry, "roverLink", 6144, this, 1, &_taskHandle, 0);
 }
 
 void RoverLink::setDrive(float left, float right) {
@@ -38,6 +39,12 @@ void RoverLink::setDrive(float left, float right) {
   _setR = right;
   _setMs = millis();
   portEXIT_CRITICAL(&_mux);
+  // changed (a tap starts / ends, a stop): wake the link task now instead of in the next 100 ms slot
+  if (_taskHandle && (fabsf(left - _lastL) > 0.005f || fabsf(right - _lastR) > 0.005f)) {
+    _lastL = left;
+    _lastR = right;
+    xTaskNotifyGive(_taskHandle);
+  }
 }
 
 String RoverLink::statusText() const {
@@ -145,8 +152,11 @@ void RoverLink::_task() {
         if (i >= 0) _voltage = reply.substring(i + 4).toFloat();
       }
     }
-    // keep the period; one command can take up to ~200 ms (rover Wi-Fi power save)
+    // keep the period; one command can take up to ~200 ms (rover Wi-Fi power save).
+    // A changed set point (setDrive) ends the wait early - after at least kMinGapMs.
     const uint32_t used = millis() - start;
-    vTaskDelay(pdMS_TO_TICKS(used < _periodMs ? _periodMs - used : 1));
+    if (used < kMinGapMs) vTaskDelay(pdMS_TO_TICKS(kMinGapMs - used));
+    const uint32_t used2 = millis() - start;
+    ulTaskNotifyTake(pdTRUE, pdMS_TO_TICKS(used2 < _periodMs ? _periodMs - used2 : 1));
   }
 }

@@ -1,4 +1,6 @@
 #include "Mission.h"
+#include "RouteWebMap.h"   // taught path / walls / marks for the Route map card (tools/make_webmap.py)
+#include "RouteMapPage.h"  // the card itself (/routemap.js)
 
 static const char* kMissionState[] = {"idle", "leg 1: wall", "leg 2: GPS", "done", "stopped", "route"};
 static const char* kRouteState[] = {"off", "turn", "drive", "avoid", "back up", "paused", "done"};
@@ -10,36 +12,44 @@ static const char kMissionJs[] PROGMEM = R"rawjs((function(){
 const c=document.createElement('div');c.className='card';
 c.innerHTML="<div class='sectionTitle'>Mission (full auto) - keep this page open and in front</div>"
  +"<div style='display:flex;gap:8px;flex-wrap:wrap;align-items:center'>"
- +"<button class='btnTiny' id='msR'>Run route B &rarr; H (log_009)</button>"
- +"<button class='btnTiny' id='msC'>Resume</button>"
- +"<select id='msL' style='padding:6px'></select><button class='btnTiny' id='msA'>Start at this leg</button>"
- +"<button class='btnTiny' id='msG'>GPS route only</button></div>"
+ +"<button class='btnTiny' id='msR' style='min-width:170px'>Run whole route</button>"
+ +"<button class='btnTiny' id='msC'>Resume</button></div>"
+ +"<div class='label' style='margin-top:10px'>Segment test</div>"
+ +"<div style='display:flex;gap:8px;flex-wrap:wrap;align-items:center'>"
+ +"<select id='msL' style='padding:6px;max-width:100%'></select>"
+ +"<button class='btnTiny' id='msO'>Test this leg only</button>"
+ +"<button class='btnTiny' id='msA'>Start here, continue</button></div>"
  +"<button class='stop' id='msS' style='width:100%;padding:18px;margin-top:10px;font-size:20px'>&#9632; STOP</button>"
  +"<div class='value' id='msInfo' style='margin-top:10px'>-</div><div class='label' id='msMore'></div>"
- +"<div class='label'>Speed = drive slider, use 0.20 (as taught). Start: rover parallel to the B facade (left wall). "
- +"Start at leg N: rover placed parallel to that leg. Any drive key pauses - then Resume.</div>";
+ +"<div class='label' id='msEnd'></div>"
+ +"<div class='label'>Speed = drive slider = the speed you taught with (log_013: 0.30). Whole route: rover at the start, parallel to the first wall. "
+ +"Leg test: rover placed where that leg started, pointing along it. Any drive key pauses - then Resume.</div>";
 const d=document.getElementById('driveCard'),w=document.querySelector('.wrap');
 w.insertBefore(c,d||w.children[2]);
 const $=id=>document.getElementById(id);
 let running=false;
-fetch('/mission/legs',{cache:'no-store'}).then(r=>r.json()).then(a=>{a.forEach((n,i)=>{const o=document.createElement('option');o.value=i;o.textContent=(i+1)+': '+n;$('msL').appendChild(o);});}).catch(()=>{});
+fetch('/mission/legs',{cache:'no-store'}).then(r=>r.json()).then(a=>{
+ a.forEach((n,i)=>{const o=document.createElement('option');o.value=i;o.textContent=(i+1)+': '+n;$('msL').appendChild(o);});
+ $('msR').textContent='Run whole route (legs 1-'+a.length+')';}).catch(()=>{});
 async function st(){try{
   const j=await (await fetch('/mission/status',{cache:'no-store'})).json();
   running=j.running;
-  $('msInfo').textContent='Mission: '+j.state+(j.paused?'  (PAUSED - no heartbeat)':'')+(j.msg?('  |  '+j.msg):'');
+  $('msInfo').textContent='Mission: '+j.state+(j.only?' (leg test)':'')+(j.paused?'  (PAUSED - no heartbeat)':'')+(j.msg?('  |  '+j.msg):'');
   $('msInfo').style.color=running?(j.paused?'#ffb020':'#4ea1ff'):(j.canResume?'#ffb020':'');
-  $('msMore').textContent=j.rleg?('leg '+j.rleg+'/'+j.rn+' '+j.rstate+'  |  effort '+j.reff+' %  |  speed '+j.spd):(j.leg+'  |  WP '+j.wp+'/'+j.n+'  |  speed '+j.spd);
+  $('msMore').textContent=j.rleg?('leg '+j.rleg+'/'+j.rn+' '+j.rstate+'  |  effort '+j.reff+' %  |  speed '+j.spd):('speed '+j.spd);
+  $('msEnd').textContent=j.lastEnd?('last leg end: '+j.lastEnd):'';
   $('msC').disabled=!j.canResume||running;
 }catch(e){}}
 const spd=()=>{const s=document.getElementById('spd');return s?parseFloat(s.value):0.2;};
 const go=u=>fetch(u,{cache:'no-store'}).then(()=>{running=true;st();});
 $('msR').onclick=()=>go('/mission/route?leg=0&spd='+spd().toFixed(2));
+$('msO').onclick=()=>go('/mission/route?only=1&leg='+$('msL').value+'&spd='+spd().toFixed(2));
 $('msA').onclick=()=>go('/mission/route?leg='+$('msL').value+'&spd='+spd().toFixed(2));
 $('msC').onclick=()=>go('/mission/resume?spd='+spd().toFixed(2));
-$('msG').onclick=()=>go('/mission/gps?spd='+spd().toFixed(2));
 $('msS').onclick=()=>fetch('/mission/stop',{cache:'no-store'}).then(st);
 setInterval(()=>{if(running&&!document.hidden)fetch('/mission/alive',{cache:'no-store'}).catch(()=>{});},250);
 setInterval(st,1000);st();
+const rm=document.createElement('script');rm.src='/routemap.js';document.body.appendChild(rm);  // Route map card
 })();)rawjs";
 
 // ---------------------------------------------------------------------------------------------
@@ -70,6 +80,7 @@ bool Mission::begin(AsyncWebServer* server) {
     float sp = 0.2f;
     if (req->hasParam("spd")) sp = req->getParam("spd")->value().toFloat();
     _reqLeg = req->hasParam("leg") ? (uint8_t)req->getParam("leg")->value().toInt() : 0;
+    _reqOnly = req->hasParam("only") && req->getParam("only")->value() == "1";
     _reqSpeed = sp;
     _aliveMs = millis();
     _reqRoute = true;
@@ -82,6 +93,24 @@ bool Mission::begin(AsyncWebServer* server) {
     _aliveMs = millis();
     _reqResume = true;
     req->send(200, "application/json", "{\"ok\":true}");
+  });
+  server->on("/routemap.js", HTTP_GET, [](AsyncWebServerRequest* req) {
+    req->send(200, "application/javascript", kRouteMapJs);
+  });
+  // ~30 kB from flash in pieces (no copy in RAM)
+  server->on("/route/map.json", HTTP_GET, [](AsyncWebServerRequest* req) {
+    const size_t len = strlen(kRouteWebMapJson);
+    AsyncWebServerResponse* res = req->beginResponse("application/json", len,
+        [len](uint8_t* buf, size_t maxLen, size_t index) -> size_t {
+          const size_t n = (len - index) < maxLen ? (len - index) : maxLen;
+          memcpy(buf, kRouteWebMapJson + index, n);
+          return n;
+        });
+    res->addHeader("Cache-Control", "max-age=3600");
+    req->send(res);
+  });
+  server->on("/route/live", HTTP_GET, [this](AsyncWebServerRequest* req) {
+    req->send(200, "application/json", _liveJson());
   });
   server->on("/mission/legs", HTTP_GET, [](AsyncWebServerRequest* req) {
     String j = "[";
@@ -117,14 +146,14 @@ void Mission::pollRequests(const Sensors& s, WallFollow& wall, GpsNav& nav) {
     _speed = constrain((float)_reqSpeed, minSpeed, maxSpeed);
     wall.stop();
     nav.stop();
-    const bool ok = resume ? route.resume(_speed) : route.start(s, wall, _reqLeg, _speed);
+    const bool ok = resume ? route.resume(_speed) : route.start(s, wall, _reqLeg, _speed, _reqOnly);
     if (ok) {
       _state = ROUTE;
       _paused = false;
       _legStartMs = millis();
       strlcpy(_msg, route.msg(), sizeof(_msg));
-      Serial.printf("[mission] route %s leg %u, speed %.2f\n", resume ? "resume" : "start",
-                    (unsigned)(route.legIndex() + 1), _speed);
+      Serial.printf("[mission] route %s leg %u%s, speed %.2f\n", resume ? "resume" : "start",
+                    (unsigned)(route.legIndex() + 1), route.singleLeg() ? " (this leg only)" : "", _speed);
     } else {
       _state = ABORTED;
       strlcpy(_msg, resume ? "nothing to resume" : route.msg(), sizeof(_msg));
@@ -170,6 +199,60 @@ void Mission::pollRequests(const Sensors& s, WallFollow& wall, GpsNav& nav) {
   _rEffPct = (uint8_t)constrain(lroundf(route.effortFrac() * 100.0f), 0L, 255L);
   _rCanResume = route.canResume() && route.state() != RouteFollow::DONE;
   if (_state == ROUTE) strlcpy(_msg, route.msg(), sizeof(_msg));
+  portENTER_CRITICAL(&_mux);
+  strlcpy(_endInfo, route.lastEnd(), sizeof(_endInfo));
+  portEXIT_CRITICAL(&_mux);
+  // for the Route map card (4 Hz is enough): believed position = leg + effort fraction, route yaw, scan
+  if (millis() - _liveMs >= 250) {
+    _liveMs = millis();
+    const bool run = route.canResume() || route.state() == RouteFollow::DONE || route.active();
+    portENTER_CRITICAL(&_mux);
+    _liveRun = run;
+    _liveLeg = route.legIndex();
+    _liveFrac = route.effortFrac();
+    _liveRy = run ? route.routeYaw(s) : 0;
+    _liveSt = route.state();
+    _liveLp = route.pathOn() ? (route.pathLocked() ? 2 : 1) : 0;
+    if (_liveLp) {
+      const LocalLocalizer& P = route.local();
+      P.global(_liveGx, _liveGy, _liveGth);
+      P.waypointGlobal(route.pathLookM, _liveWx, _liveWy);   // look-ahead point on the straight-line path
+      _liveLs = P.s(); _liveLe = P.sEnd(); _liveOff = P.off();
+    }
+    for (uint8_t i = 0; i < Sensors::kLidarPoints; i++) _liveScan[i] = s.lidarCm(i);
+    portEXIT_CRITICAL(&_mux);
+  }
+}
+
+// Runs in the web task: copies only.
+String Mission::_liveJson() const {
+  uint16_t scan[Sensors::kLidarPoints];
+  portENTER_CRITICAL(&_mux);
+  const bool run = _liveRun; const uint8_t leg = _liveLeg, st = _liveSt;
+  const float frac = _liveFrac, ry = _liveRy;
+  const uint8_t lp = _liveLp;
+  const float wx = _liveWx, wy = _liveWy, gx = _liveGx, gy = _liveGy, gth = _liveGth, ls = _liveLs, le = _liveLe, off = _liveOff;
+  memcpy(scan, _liveScan, sizeof(scan));
+  portEXIT_CRITICAL(&_mux);
+  String j;
+  j.reserve(680);
+  j += "{\"run\":"; j += run ? "true" : "false";
+  j += ",\"mapOk\":"; j += (kWebMapLegs == RouteFollow::count()) ? "true" : "false";
+  j += ",\"leg\":"; j += (unsigned)leg;
+  j += ",\"frac\":"; j += String(frac, 3);
+  j += ",\"ry\":"; j += String(ry, 1);
+  j += ",\"lp\":"; j += (unsigned)lp;
+  if (lp) {   // LiDAR-localised pose in the map frame (m, deg), position along the leg path, off the path
+    j += ",\"gx\":"; j += String(gx, 2); j += ",\"gy\":"; j += String(gy, 2);
+    j += ",\"wx\":"; j += String(wx, 2); j += ",\"wy\":"; j += String(wy, 2);
+    j += ",\"gth\":"; j += String(gth * RAD_TO_DEG, 1);
+    j += ",\"ls\":"; j += String(ls, 2); j += ",\"le\":"; j += String(le, 2); j += ",\"off\":"; j += String(off, 2);
+  }
+  j += ",\"st\":\""; j += kRouteState[st < 7 ? st : 0];
+  j += "\",\"scan\":[";
+  for (uint8_t i = 0; i < Sensors::kLidarPoints; i++) { if (i) j += ','; j += (unsigned)scan[i]; }
+  j += "]}";
+  return j;
 }
 
 void Mission::steer(const Sensors& s, WallFollow& wall, GpsNav& nav, float padL, float padR, uint32_t padAge,
@@ -236,7 +319,11 @@ String Mission::statusText() const {
 
 String Mission::_statusJson() const {
   String j;
-  j.reserve(320);
+  j.reserve(420);
+  char endInfo[sizeof(_endInfo)];
+  portENTER_CRITICAL(&_mux);
+  memcpy(endInfo, _endInfo, sizeof(endInfo));
+  portEXIT_CRITICAL(&_mux);
   j += "{\"running\":"; j += active() ? "true" : "false";
   j += ",\"state\":\""; j += kMissionState[_state];
   j += "\",\"paused\":"; j += _paused ? "true" : "false";
@@ -250,6 +337,8 @@ String Mission::_statusJson() const {
   j += ",\"rstate\":\""; j += kRouteState[_rState < 7 ? _rState : 0];
   j += "\",\"reff\":"; j += (unsigned)_rEffPct;
   j += ",\"canResume\":"; j += _rCanResume ? "true" : "false";
+  j += ",\"only\":"; j += route.singleLeg() ? "true" : "false";
+  j += ",\"lastEnd\":\""; j += endInfo; j += "\"";
   j += ",\"msg\":\""; j += _msg; j += "\"}";
   return j;
 }

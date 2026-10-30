@@ -33,6 +33,9 @@ public:
   bool lidarOk() const { return _lidarOk; }
   bool imuOk() const { return _imuReady; }
   float yawDeg() const { return _yaw; }      // ISO 8855: + = turning left, 0 = magnetic north
+  // live yaw (IMU read at 50 Hz), not the 4 Hz snapshot: for the heading controller only - the
+  // snapshot yaw belongs to the same moment as the LiDAR snapshot, use that one with the scan
+  float yawNowDeg() const { return _imuReady ? _imu.yawDeg() : _yaw; }
   float pitchDeg() const { return _pitch; }  // + = front down
   float rollDeg() const { return _roll; }    // + = right side down
   uint8_t magCal() const { return _cal[3]; } // magnetometer calibration 0..3
