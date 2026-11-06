@@ -98,7 +98,18 @@ public:
   // LiDAR obstacle handling and hard stop are OFF, and cas_box.ino switches the SafetyGuard LiDAR
   // stop off; the front ULTRASONIC stop (25 cm), the tilt stop and the stuck detection stay ON.
   // log_013 route: leg 4 (M5-M10, ramp up/down), leg 5 (M10-M13, ramp), leg 11 (M23-M28, ramp).
-  uint32_t rampLegs = (1u << 3) | (1u << 4) | (1u << 10);
+  // log_026 (06.11.): leg 4 (M16-M37) holds the ramp (160 s above 4 deg pitch, up to 18 deg)
+  uint32_t rampLegs = (1u << 3);
+  // YAW-ONLY legs (bit i = leg i+1), 06.11.: open area / ramp, where the LiDAR match is weak (replay of
+  // log_025 on the log_026 map located legs 1-4 at 90-100 %; legs 2 and 11 are the open areas). On these legs the
+  // rover does NOT steer on the LiDAR path: it holds the taught heading ref in the route yaw frame
+  // (relative gyro yaw + the offset corrected on the wall legs before). The leg ends on the taught
+  // distance (effort) + the LiDAR end-scan match. Obstacle handling and SafetyGuard stay on; the LiDAR
+  // localiser keeps running so it can lock again on the next leg.
+  uint32_t yawLegs = (1u << 1) | (1u << 10);   // log_026: legs 2 (M7-M11) and 11 (M52-M62), tagged "open area"
+  bool onYawLeg() const { return active() && ((yawLegs >> _i) & 1u); }
+  uint32_t turnTimeoutMs = 12000;  // TURN between legs: after this long drive the leg anyway (no hang)
+  float pathEndMinFrac = 0.5f;   // "path end" ends a leg only after this share of the taught effort
   bool onRamp() const { return active() && ((rampLegs >> _i) & 1u); }
   // LOCAL PATH MODE (2026-10-29): every leg in its own frame (LocalPath.h, tools/localpath.py).
   // LocalLocalizer gives x / y / heading in the leg frame (gyro + speed guess + LiDAR matched
@@ -113,6 +124,7 @@ public:
                               // 12 cm Douglas-Peucker); false: carrot on the raw taught path
   bool pathOn() const { return _lpOn; }
   bool pathLocked() const;
+  bool _pathSteer() const;    // pathLocked() and not a yaw-only leg
   float _pathErrRad() const;
   const LocalLocalizer& local() const { return _lp; }
   float wallJumpDeg = 8.0f;   // wall reading this far off the median of the last 5: dropped
@@ -125,7 +137,7 @@ public:
   float tapGain0 = 100.0f;    // deg turned per second of tap, start value (learned per run: tapGain())
   float tapAim = 0.8f;        // ask a tap for this share of the error (undershoot, never overshoot)
   uint32_t tapMinMs = 40, tapMaxMs = 300;   // tap length limits (a big turn = several taps)
-  float boostMax = 0.15f, boostStep = 0.03f;   // no progress while rolling: + this per 0.25 s, up to max
+  float boostMax = 0.05f, boostStep = 0.01f;   // no progress while rolling: + this per 0.25 s, up to max
   uint32_t settleMs = 600;    // after a tap: wait this long (and until < 12 deg/s) before deciding again
   float rollBackCmd = 0.2f;   // rolling backwards (obstacle ahead)
   float lookAheadM = 1.5f;    // wall legs: aim at the set distance this far ahead
@@ -139,7 +151,21 @@ public:
   float maxEffortFrac = 1.6f; // only with autoAdvance = false: more effort (+4) -> PAUSE
   uint8_t maxBackups = 5;     // stuck: back up and retry this often in one leg, then PAUSE
   float zoneWarnM = 15.0f;
-  float pivotCmd = 0.5f;      // turning on the spot needs 0.5 (MotorShaper.pivotMin)
+  float pivotCmd = 0.35f;     // soft pivot (05.11.: Kethan's 90-degree turns at 0.35; was 0.5 taps)
+  // rolling heading hold (05.11., Kethan's steerForward - it drove log_025 straight, hold error < 2.3 deg)
+  float hKp = 0.045f;         // wheel difference per deg of error
+  float hKd = 0.0015f;        // per deg/s of yaw rate (damping)
+  float corrMax = 0.10f;      // |wheel difference / 2| limit
+  float corrFrac = 0.40f;     // ... and at most this share of the speed
+  float corrRate = 0.30f;     // the correction changes by at most this per second
+  float pivotCoastS = 0.45f;  // pivot released |rate| * this early (rover lag + MotorShaper turn ramp-down)
+  float pivotDoneDeg = 5.0f;  // pivot ends inside this (the rolling PD does the rest)
+  float backupCmd = 0.20f;    // stuck: back up at this (was 0.3)
+  float stuckMinOut = 0.15f;  // stuck check only counts while the REAL wheel output is at least this
+  float stuckMinTurn = 0.20f; // ... or while pivoting with at least this REAL turn output (06.11.)
+  float pivotBoostMax = 0.10f, pivotBoostRate = 0.05f;   // pivot not turning: + 0.05/s up to + 0.10 (06.11.)
+  uint8_t stuckWindows = 3;   // scene unchanged in this many 2 s windows in a row -> back up (was 2)
+  uint8_t boostAfterSteps = 8;  // no progress for 2 s while rolling -> gentle push (was 0.75 s)
   // arcMax = 0 -> no arcs at all: pivots only (if the field test shows arcs stall this rover)
   enum EndRule : uint8_t { RULE_OLD = 0, RULE_COMBINED = 1 };
   uint8_t endRule = RULE_COMBINED;  // how a leg ends (see LIDAR LOCALISATION above)
@@ -200,6 +226,10 @@ private:
   uint8_t _seen = 0, _lostN = 0, _foundN = 0, _lowN = 0;
   // controller
   bool _ctrlOn = false, _tgtFwd = true, _pivoting = false;
+  float _hc = 0;                      // rolling heading correction (half wheel difference, + = left)
+  float _outV = 0;                    // forward output that really went to the rover (feedOutput)
+  float _outW = 0;                    // turn output that really went to the rover (feedOutput)
+  float _pivBoost = 0;                // extra pivot command while the pivot does not turn the rover
   float _tgtYaw = 0, _tgtV = 0, _yawDesF = 0, _rate = 0, _prevYaw = 0;
   uint32_t _ctrlMs = 0, _pivotMs = 0, _unstallUntil = 0, _arcMs = 0;
   bool _yawDesInit = false;

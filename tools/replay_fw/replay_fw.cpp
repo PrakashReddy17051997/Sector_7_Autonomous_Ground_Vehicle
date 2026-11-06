@@ -47,6 +47,7 @@ int main(int argc, char** argv) {
   auto num = [](const std::string& s) { return s.empty() ? 0.0 : atof(s.c_str()); };
 
   Sensors s; WallFollow wf; RouteFollow rf;
+  if (getenv("TEACH")) { rf.stuckWindows = 255; rf.maxBackups = 255; rf.avoidEnterM = 0.01f; rf.hardStopM = 0.0f; rf.lpStopM = 0.0f; }   // open loop on a teaching log: no stuck pauses
   bool running = false; int prevSt = 0;
   const double t0 = num(rows[0][cT]);
   printf("t,log_leg,log_st,leg,st,located,x,y,th,s,s_end,off,score,carrot_err,ctrl_err,why,cmd_l,cmd_r,log_cmd_l,log_cmd_r,msg\n");
@@ -58,15 +59,25 @@ int main(int argc, char** argv) {
     float dy = fmodf(y1 - y0 + 540.0f, 360.0f) - 180.0f;
     s._yaw = y0; s._pitch = cP >= 0 ? (float)num(R[cP]) : 0;
     const int lst = cSt >= 0 ? (int)num(R[cSt]) : 0, lleg = cLeg >= 0 ? (int)num(R[cLeg]) : 0;
-    const bool act = lst >= 1 && lst <= 4;
-    if (act && !(prevSt >= 1 && prevSt <= 4) && lleg >= 1) {     // (re)start in the log
+    // teaching log (no route states): start the route at leg 1 when the rover first moves
+    static bool teachStarted = false;
+    const bool teach = getenv("TEACH") != nullptr;
+    bool act = lst >= 1 && lst <= 4;
+    int lleg2 = lleg;
+    if (teach) {
+      const bool moving = fabs(num(R[cOl])) + fabs(num(R[cOr])) > 0.05;
+      if (!teachStarted && moving) { teachStarted = true; }
+      act = teachStarted; lleg2 = 1;
+      if (act && prevSt == 0) { prevSt = 0; }
+    }
+    if (act && !(prevSt >= 1 && prevSt <= 4) && lleg2 >= 1 && !(teach && running)) {     // (re)start in the log
       g_ms = (uint32_t)(t * 1000);
       s._yawNow = y0;
-      running = rf.start(s, wf, (uint8_t)(lleg - 1), 0.30f, false);
+      running = rf.start(s, wf, (uint8_t)(lleg2 - 1), 0.30f, false);
       if (!running) fprintf(stderr, "t %.1f start leg %d failed: %s\n", t, lleg, rf.msg());
     }
     if (!act) running = false;
-    prevSt = lst;
+    prevSt = teach ? (act ? 2 : 0) : lst;
     float l = 0, r = 0;
     const float ol = cOl >= 0 ? (float)num(R[cOl]) : 0, orr = cOr >= 0 ? (float)num(R[cOr]) : 0;
     // 50 Hz between this record and the next: yaw interpolated, the REAL output fed as effort

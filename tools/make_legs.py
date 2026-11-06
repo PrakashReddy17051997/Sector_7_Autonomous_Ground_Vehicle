@@ -60,6 +60,7 @@ END = {"LOST": 0, "FOUND_L": 1, "FOUND_R": 2, "FRONT": 3, "EFFORT": 4}
 
 def load(path):
     A = pd.read_csv(path)
+    A.attrs["path"] = str(path)
     lid = [c for c in A.columns if c.startswith("lidar")]
     S = A[lid].values.astype(float)
     A = A[[c for c in A.columns if not c.startswith("lidar")]].copy()
@@ -178,6 +179,8 @@ def build(A, S, merge=True):
         eff = float(A.vf.values[i0:i1 + 1].sum() * 0.25)
         g = A.iloc[i0:i1 + 1]
         gd = math.hypot(g.east_m.iloc[-1] - g.east_m.iloc[0], g.north_m.iloc[-1] - g.north_m.iloc[0])
+        if not np.isfinite(gd):   # 2026-11-05: no GPS in the log -> GPS counts as blind on every leg
+            gd = 0.0
         blind = gd < 0.25 * eff  # GPS hardly moved although the rover drove: GPS blind zone
         if plan is not PLAN:          # tagged: name = start and end mark of the leg + how it ends
             name = f"M{max(m0, 1)}-M{m1 + 1} {name}"[:40]
@@ -187,7 +190,98 @@ def build(A, S, merge=True):
                          noRight=noRight, gpsA=gpsA, gate=gate))
     if merge:
         legs = merge_legs(legs, A)
+    if GEO:
+        legs = geo_legs(A, S, legs)
     return legs, (Ld, La, Rd, Ra)
+
+
+# ------------------------------------------------------------------------------------------------
+# 2026-11-06: legs from LOCATIONS, not from the driver's behaviour.
+# Before, ref = the IMU heading the driver held and effort = the driver's wheel command * time. Both carry
+# the driver's corrections, reversing, slow pushing and wheel slip (log_025: only 0.4-0.5 m per effort ->
+# every leg twice too "long"). Now, from the LiDAR trajectory (lidar_map.run, cached next to the CSV):
+#   start = where the leg starts (end of the previous leg), end = where it ends (its last record i1)
+#   length = distance driven FORWARD only (no reversing, no turning on the spot), at most GEO_MAX_STRETCH
+#            x the straight start->end distance (zig-zag and wandering do not count)
+#   effort = length / K_SPEED (= what a healthy rover needs: 1 m per effort, log_013 / log_026)
+#   ref    = direction start -> end in the route yaw frame, for HOLD legs >= GEO_MIN_M long (short legs
+#            and WALL legs keep the measured heading: a WALL leg's ref is the wall direction, the box
+#            anchors on it)
+GEO = True
+K_SPEED = 1.0
+GEO_MIN_M = 2.0
+GEO_MAX_STRETCH = 1.3
+
+
+def _slam(A, S):
+    import lidar_map as LMAP
+    src = A.attrs.get("path")
+    cache = Path(src).with_name(Path(src).stem + "_slam.npy") if src else None
+    if cache is not None and cache.exists():
+        T = np.load(cache)
+        if len(T) == len(A):
+            return T
+    T = LMAP.run(A, S, verbose=False)
+    if cache is not None:
+        np.save(cache, T)
+    return T
+
+
+def geo_legs(A, S, legs):
+    T = _slam(A, S)
+    x = pd.Series(T[:, 0]).rolling(5, center=True, min_periods=1).mean().values
+    y = pd.Series(T[:, 1]).rolling(5, center=True, min_periods=1).mean().values
+    step = np.r_[0, np.hypot(np.diff(x), np.diff(y))]
+    l, r = A.out_l.values, A.out_r.values
+    fwd = (l > 0.02) & (r > 0.02)                      # rolling forward (not reversing, not a pivot)
+    off = np.degrees(np.angle(np.exp(1j * (np.radians(A.yaw.values) - T[:, 2]))))   # yaw - SLAM heading
+    # fixed bias travel direction - IMU heading (LiDAR mount angle / the rover crabbing): median over clean
+    # straight forward runs (>= 0.8 m, heading steady within 3 deg). Removed from every geometric direction,
+    # so the box does not steer this many degrees off on every leg.
+    bias = []
+    i = 0
+    n = len(A)
+    yw = A.yaw.values
+    while i < n - 1:
+        if not fwd[i]:
+            i += 1
+            continue
+        j, d = i, 0.0
+        while j < n - 1 and fwd[j + 1] and d < 0.8:
+            j += 1
+            d += step[j]
+        if d >= 0.8 and np.ptp(yw[i:j + 1]) < 3.0 and T[i:j + 1, 3].all():
+            trav = np.degrees(np.arctan2(y[j] - y[i], x[j] - x[i])) + np.mean(off[i:j + 1])
+            bias.append((trav - np.mean(yw[i:j + 1]) + 180.0) % 360.0 - 180.0)
+        i = j + 1
+    bias_deg = float(np.median(bias)) if len(bias) >= 5 else 0.0
+    print(f"// GEO: travel - heading bias {bias_deg:+.1f} deg from {len(bias)} straight runs (removed)", file=sys.stderr)
+    first = int(np.argmax(np.abs(l) + np.abs(r) > 0.05))
+    r0 = first
+    print("// legs from locations (GEO): leg  straight m  forward m  effort old -> new   ref old -> new", file=sys.stderr)
+    for k, L in enumerate(legs):
+        r1 = int(L["i1"])
+        if r1 <= r0:
+            r0 = r1 + 1
+            continue
+        dx, dy = x[r1] - x[r0], y[r1] - y[r0]
+        straight = float(np.hypot(dx, dy))
+        fwd_m = float(step[r0 + 1:r1 + 1][fwd[r0 + 1:r1 + 1]].sum())
+        length = max(straight, min(fwd_m, GEO_MAX_STRETCH * straight)) if straight > 0.3 else fwd_m
+        eff_new = max(0.5, length / K_SPEED)
+        ref_new = L["ref"]
+        if L["kind"] == "HOLD" and straight >= GEO_MIN_M:
+            seg = slice(r0, r1 + 1)
+            ok = T[seg, 3].astype(bool)
+            o = float(np.degrees(np.angle(np.mean(np.exp(1j * np.radians(off[seg][ok] if ok.any() else off[seg]))))))
+            ref_new = float(np.degrees(np.arctan2(dy, dx)) + o - bias_deg)
+            ref_new = L["ref"] + ((ref_new - L["ref"] + 180.0) % 360.0 - 180.0)   # keep the unwrapped branch
+        print(f"//   {k + 1:2d}  {straight:6.1f}  {fwd_m:7.1f}   {L['eff']:5.1f} -> {eff_new:5.1f}   {L['ref']:7.1f} -> {ref_new:7.1f}",
+              file=sys.stderr)
+        L["eff_driver"], L["ref_driver"] = L["eff"], L["ref"]
+        L["eff"], L["ref"] = eff_new, ref_new
+        r0 = r1 + 1
+    return legs
 
 
 MERGE_DEG = 12.0   # merge a leg without landmark into the next one if both point within this
@@ -224,7 +318,8 @@ def merge_legs(legs, A):
 
 def print_table(legs, src):
     print(f"// {len(legs)} legs from {src} (tools/make_legs.py). ref = route yaw (gyro frame of the")
-    print("// teaching run, deg, + = left), dSet m, effort = sum(forward wheel cmd * s), gate, end GPS = zone only")
+    print("// teaching run, deg, + = left), dSet m, effort = forward path length / 1 m per effort (GEO, from the LiDAR")
+    print("// trajectory: not the driver's commands), ref of HOLD legs = direction start -> end, gate, end GPS = zone only")
     print("static const RouteFollow::Leg kRoute[] = {")
     for k, L in enumerate(legs):
         print(f"  {{RouteFollow::{L['kind']}, {(-1 if L['side'] == 'L' else 1):2d}, RouteFollow::END_{L['end']}, "

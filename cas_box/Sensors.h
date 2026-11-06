@@ -31,8 +31,10 @@ public:
   // LiDAR point i (0 = front, clockwise, 4 deg each) in cm, 0 = no reliable return
   uint16_t lidarCm(uint8_t i) const { return i < kLidarPoints ? _lidarCm[i] : 0; }
   bool lidarOk() const { return _lidarOk; }
-  bool imuOk() const { return _imuReady; }
-  float yawDeg() const { return _yaw; }      // ISO 8855: + = turning left, 0 = magnetic north
+  // 2026-11-04: imuOk() = IMU started AND a checked sample in the last 0.5 s (ImuManager::headingReady)
+  bool imuOk() const { return _imuReady && _imu.headingReady(); }
+  uint32_t imuBadSamples() const { return _imu.badSamples(); }
+  float yawDeg() const { return _yaw; }      // ISO 8855: + = turning left, 0 = first valid IMU reading
   // live yaw (IMU read at 50 Hz), not the 4 Hz snapshot: for the heading controller only - the
   // snapshot yaw belongs to the same moment as the LiDAR snapshot, use that one with the scan
   float yawNowDeg() const { return _imuReady ? _imu.yawDeg() : _yaw; }

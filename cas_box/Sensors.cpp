@@ -46,13 +46,13 @@ void Sensors::update() {
   }
 }
 
-// The IMU start blocks ~3.5 s once (north alignment); RoverLink's deadman stops the rover meanwhile.
+// IMU start (2026-11-04): no blocking north alignment any more, yaw 0 = first valid reading.
 void Sensors::_startImuIfPresent() {
   const uint32_t now = millis();
   if (now - _lastImuTryMs < kImuRetryMs) return;
   _lastImuTryMs = now;
   if (!i2cPresent(kImuAddr)) return;
-  Serial.println("[sensors] BNO055 found, starting IMU (~3.5 s)");
+  Serial.println("[sensors] BNO055 found, starting IMU (IMUPLUS, checked reads)");
   _imuReady = _imu.begin();
 }
 

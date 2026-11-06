@@ -66,9 +66,13 @@
 
 // ---- YOUR KIT ------------------------------------------------------------------------------
 const int BOX_ID = 4;                      // 1..10 = kit number on the box
+// Wi-Fi transmit power: at start (smallest current spike) and while running. Raise WIFI_TX_RUN to
+// WIFI_POWER_19_5dBm only if the phone or the rover lose the connection - and only with a good supply.
+#define WIFI_TX_START WIFI_POWER_8_5dBm
+#define WIFI_TX_RUN WIFI_POWER_15dBm
 
 // ---- settings --------------------------------------------------------------------------------
-const float MAX_SPEED = 0.5f;             // drive pad maximum; 0.5 = full rover speed (100 % PWM)
+const float MAX_SPEED = 0.30f;            // drive pad + mission maximum (05.11.: 0.25 + 0.05; slider steps 0.05!)
 const uint32_t PAD_TIMEOUT_MS = 400;      // no update from the phone for this long -> stop
 const int LIDAR_OFFSET_DEG = 90;          // rotates the LiDAR view so that "front" is up
 const bool USE_SAFETY_GUARD = true;       // false = drive commands go to the rover unchanged
@@ -106,6 +110,7 @@ void updateOled() {
 void setup() {
   Serial.begin(115200);
   delay(200);
+  Serial.println("[boot] 1 setup start");
 
   // naming scheme, derived from BOX_ID only (see header)
   snprintf(boxSsid, sizeof(boxSsid), "CAS-Box-%02d", BOX_ID);
@@ -115,7 +120,13 @@ void setup() {
   hmi.setTitle(String("CAS Box ") + BOX_ID);
   hmi.enableDrivePad(MAX_SPEED);
   hmi.setStateText("Starting ...");
+  // Gentle start (2026-11-01, brownout resets at power-on): the Wi-Fi radio starts at reduced transmit
+  // power, so its current spike is smaller; full power is not needed - the rover is next to the box.
+  WiFi.mode(WIFI_AP);
+  WiFi.setTxPower(WIFI_TX_START);
+  Serial.println("[boot] 2 wifi starting");
   hmi.begin(boxSsid, boxPassword, IPAddress(192, 168, 10 + BOX_ID, 1), channel);
+  Serial.println("[boot] 3 wifi up");
 
   // Less delay box -> rover (log_004): the rover's Wi-Fi sleeps between beacons and only wakes
   // every DTIM beacons to fetch data. DTIM 1 = it wakes at every beacon (100 ms instead of 200 ms).
@@ -124,7 +135,7 @@ void setup() {
     apCfg.ap.dtim_period = 1;
     esp_wifi_set_config(WIFI_IF_AP, &apCfg);
   }
-  WiFi.setTxPower(WIFI_POWER_19_5dBm);  // full transmit power (box is inside a closed case)
+  WiFi.setTxPower(WIFI_TX_RUN);         // was 19.5 dBm; lower = smaller current peaks (brownout)
 
   // Drive log: mounts the flash file system and adds its web routes (/log.js, /log/...).
   // The very first boot formats the storage once (a few seconds).
@@ -142,8 +153,12 @@ void setup() {
   guard.cfg.useFrontAngled = false;
   // guard.cfg.frontStopCm = 25;
 
+  Serial.println("[boot] 4 log + web ready, starting sensors (LiDAR motor) in 0.5 s");
+  delay(500);                        // let the supply recover from the Wi-Fi start first
   sensors.begin(LIDAR_OFFSET_DEG);
+  Serial.println("[boot] 5 sensors started");
   rover.begin(100);  // sends the current drive command every 100 ms
+  Serial.println("[boot] 6 setup done");
 }
 
 void loop() {
@@ -179,7 +194,7 @@ void loop() {
   shaper.setBattery(rover.voltage());   // battery compensation (MotorShaper: full pack -> smaller cmds)
   shaper.setPitch(sensors.pitchDeg());  // slope: less forward output downhill, a bit more uphill
   shaper.boost = mission.active() ? mission.route.boost() : 0.0f;   // no progress on rough ground: more
-  shaper.apply(l, r, safetyReason != SafetyGuard::TILT);
+  shaper.apply(l, r, safetyReason != SafetyGuard::OK);   // gradual; a guard stop (obstacle / tilt) drops the speed at once
 
   rover.setDrive(l, r);                 // every loop pass, after guard and shaper
   // route progress = what really went to the rover, as the command it equals at 11.6 V (so the
@@ -229,10 +244,11 @@ void loop() {
     hmi.setStateText(state);
     hmi.showValue("rover.ip", rover.ip().toString());
     hmi.showValue("rover.voltage_V", rover.voltage());
-    hmi.showValue("motor.vscale", String(shaper.vScale(), 3) + (shaper.vComp ? "" : " (off)"));
+    hmi.showValue("drive.v_w", String(shaper.v(), 3) + " / " + String(shaper.w(), 3));
     hmi.showValue("motor.slope", String(shaper.slopeFactor(), 2) + " / boost " + String(shaper.boost, 2));
-    hmi.showValue("route.tap", String(mission.route.tapGain(), 0) + " deg/s, drift " +
-                  String(mission.route.driftDegS(), 1) + " deg/s, progress " + String(mission.route.progressCm(), 1) + " cm");
+    hmi.showValue("route.ctrl", "err " + String(mission.route.ctrlErrDeg(), 1) + " deg, progress " +
+                  String(mission.route.progressCm(), 1) + " cm" + (mission.route.onYawLeg() ? ", YAW-ONLY leg" : "") +
+                  (sensors.imuOk() ? "" : ", IMU INVALID"));
     hmi.showValue("rover.rtt_ms", rover.rttMs());
     hmi.showValue("rover.ok", (double)rover.okCount());
     hmi.showValue("rover.fail", (double)rover.failCount());

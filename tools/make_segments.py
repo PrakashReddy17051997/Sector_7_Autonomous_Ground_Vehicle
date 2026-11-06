@@ -51,8 +51,20 @@ def load(path):
     return A[[c for c in A.columns if not c.startswith("lidar_")]].copy(), S
 
 
+K_SPEED = 1.0  # m/s per forward command, the same as LocalLocalizer::kSpeed on the box
+
+
+def has_gps(A):
+    return int(((A.gps_fix == 1) & A.east_m.notna()).sum()) >= 10
+
+
 def path_length(A):
-    """distance along the driven path (m) from smoothed GPS: the GPS offset cancels inside one run"""
+    """distance along the driven path (m). With GPS: smoothed GPS (the offset cancels inside one run).
+    Without GPS (2026-11-05: GPS off, the log fields carry route debug): forward output * time * K_SPEED."""
+    if not has_gps(A):
+        vf = ((A.out_l + A.out_r) / 2).clip(lower=0).values
+        dt = np.r_[0.25, np.clip(np.diff(A.t_s.values), 0, 1.0)]
+        return np.cumsum(vf * dt * K_SPEED)
     ch = np.r_[True, (np.diff(A.lat) != 0) | (np.diff(A.lon) != 0)] & (A.gps_fix == 1)
     g = A[ch]
     k = np.ones(5) / 5
@@ -106,6 +118,10 @@ def write_header(path, legs, end_keys, keys, info, src):
 # ------------------------------------------------------------------------------------------ check
 def check(A, S, sA, legs, end_keys, keys, info, rep_path):
     B, SB = load(rep_path)
+    if not has_gps(A) or not has_gps(B):
+        print("--check needs GPS in both logs (it places the repeat run on the teaching track with GPS).\n"
+              "These logs have no GPS: check the other sets with  python3 localpath.py replay LOG_local.npz OTHER.csv")
+        return
     ends = [sA[L["i1"]] for L in legs]
     EK = [lm.dequantise(lm.quantise(e)) for e in end_keys]          # exactly what the box has
     KK = [lm.dequantise(lm.quantise(k)) for k in keys]
