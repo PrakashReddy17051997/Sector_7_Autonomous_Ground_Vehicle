@@ -1,4 +1,5 @@
 #include "RouteFollow.h"
+#include <string.h>
 
 // ---------------------------------------------------------------------------------------------
 // THE ROUTE, taught in log_027 (2026-11-06, complete path, 139 m, M1-M72, no reversing; the driver's
@@ -94,7 +95,7 @@ bool RouteFollow::start(const Sensors& s, const WallFollow& wf, uint8_t i, float
   _lpOkMs = 0;
   _speed = speed;
   _hasRun = true;
-  _eff = 0; _I = 0; _seen = _lostN = _foundN = _frN = 0; _lowN = 0; _pivoting = false; _yawDesInit = false;
+  _eff = 0; _I = 0; _seen = _lostN = _foundN = _frN = 0; _lowN = 0; _pivoting = false; _yawDesInit = false; _climbN = 0; _climbUntil = 0;
   _avTries = 0; _stuckN = 0; _backups = 0; _refMs = 0; _overrun = false; _passEff = -99; _forced = 0;
   _wN = 0; _drift = 0; _pivotEndMs = 0; _tapPh = 0; _tapGain = tapGain0;
   _stopAfter = singleLeg ? i : 255;
@@ -284,12 +285,14 @@ void RouteFollow::_control(const Sensors& s) {
   const int8_t dir = e > 0 ? 1 : -1;                        // + = turn left
 
   // ---- soft pivot
-  if (!_pivoting && (ae >= pivotDeg || (!_tgtFwd && ae > turnDoneDeg))) {
+  // 11.11.: after a pivot let it settle 0.6 s before the next one (Kethan's stop-and-check; the early release left
+  // ~10 deg and the next pivot started at once - 14 restarts for one 83 deg turn in the sim)
+  if (!_pivoting && (ae >= pivotDeg || (!_tgtFwd && ae > turnDoneDeg)) && (ae >= pivotDeg + 20.0f || now - _pivotEndMs > 600)) {
     _pivoting = true; _pivotMs = now; _tapDir = dir; _hc = 0; _pivBoost = 0;
     if (turnTactics) { _netM = 0; _tacStart(TK_PIVOT, s, now, true); }
   }
   if (_pivoting) {
-    const float coast = fminf(7.0f, fabsf(_rate) * pivotCoastS);   // still turns this much after the release
+    const float coast = fminf(14.0f, fabsf(_rate) * pivotCoastS);  // still turns this much after the release (Kethan: 14 deg at 0.35)
     const bool done = ae <= fmaxf(pivotDoneDeg, coast) || dir != _tapDir;
     if (!done) {
       if (turnTactics) { _tactic(s, dt, now); return; }
@@ -385,7 +388,7 @@ void RouteFollow::_nextLeg(const Sensors& s, const char* how) {
   _i++;
   _loc.beginLeg(_i);
   _eff = 0; _I = 0; _seen = _lostN = _foundN = _frN = 0; _lowN = 0; _pivoting = false; _yawDesInit = false;
-  _avTries = 0; _backups = 0; _stuckN = 0; _passEff = -99; _wN = 0; _vetoLogged = false;
+  _avTries = 0; _backups = 0; _stuckN = 0; _passEff = -99; _wN = 0; _vetoLogged = false; _climbN = 0; _climbUntil = 0;
   _lmkBegin();
   _state = TURN;
   _stateMs = millis();
@@ -476,6 +479,15 @@ void RouteFollow::_step(const Sensors& s, const WallFollow& wf) {
   }
   if (_stuckN >= stuckWindows) {
     _stuckN = 0;
+    // 11.11. (log_032 M47/48: rear wheels hanging on a step, the heading hold kept one side at 0.09): first push
+    // STRAIGHT on both wheels (climbPow, no steering) for climbMs, twice per leg - then back up as before
+    if (_climbN < 2) {
+      _climbN++;
+      _state = BACKUP; _stateMs = now; _climbUntil = now + climbMs;
+      snprintf(_msg, sizeof(_msg), "stuck - climb push %u", (unsigned)_climbN);
+      Serial.println("[route] stuck -> climb push (straight)");
+      return;
+    }
     if (++_backups >= maxBackups) { pause("stuck - help me, then Resume"); return; }
     _state = BACKUP;
     _stateMs = now;
@@ -485,7 +497,9 @@ void RouteFollow::_step(const Sensors& s, const WallFollow& wf) {
 
   switch (_state) {
     case BACKUP:
-      _l = _r = -backupCmd;
+      if (now < _climbUntil) { _l = _r = climbPow; return; }               // climb push first
+      if (_climbUntil != 0 && now - _climbUntil < 300) { _l = _r = 0; return; }
+      if (_climbUntil != 0) { _climbUntil = 0; _state = DRIVE; return; }   // after the push: drive on (check again)
       if (now - _stateMs >= 2500) { _state = DRIVE; _l = _r = 0; }
       return;
 
@@ -763,16 +777,21 @@ void RouteFollow::_step(const Sensors& s, const WallFollow& wf) {
 }
 
 // ---- v3: landmark legs ---------------------------------------------------------------------------
-bool RouteFollow::setLandmarkLeg(uint8_t legIdx, const LmkPhase* ph, uint8_t n) {
+bool RouteFollow::setLandmarkLeg(uint8_t legIdx, const LmkPhase* ph, uint8_t n, float lenM) {
   if (legIdx >= kN || !ph || !n) return false;
-  for (LmkSlot& sl : _lmkSlot) if (sl.leg == legIdx || sl.leg == 255) { sl = LmkSlot{legIdx, ph, n}; return true; }
-  return false;
+  for (uint8_t k = 0; k < _lmkN; k++) if (_lmkSlot[k].leg == legIdx) { _lmkSlot[k] = LmkSlot{legIdx, ph, n, lenM}; return true; }
+  if (_lmkN >= sizeof(_lmkSlot) / sizeof(_lmkSlot[0])) return false;
+  _lmkSlot[_lmkN++] = LmkSlot{legIdx, ph, n, lenM};
+  return true;
 }
 
 void RouteFollow::_lmkBegin() {
   _lmkOn = false;
   _lmkWhy = "";
-  for (const LmkSlot& sl : _lmkSlot) if (sl.leg == _i && sl.ph) { _lmk.begin(sl.ph, sl.n); _lmkOn = true; break; }
+  for (uint8_t k = 0; k < _lmkN; k++) {
+    const LmkSlot& sl = _lmkSlot[k];
+    if (sl.leg == _i && sl.ph) { _lmk.begin(sl.ph, sl.n); _lmkOn = true; _lmkLen = sl.lenM; break; }
+  }
   if (_lmkOn) Serial.printf("[route] leg %u is a LANDMARK leg (%u phases)\n", (unsigned)(_i + 1), (unsigned)_lmk.phases());
 }
 
@@ -780,15 +799,36 @@ void RouteFollow::_lmkBegin() {
 // Obstacle handling, stuck detection and SafetyGuard ran before this (same as every leg).
 bool RouteFollow::_lmkDrive(const Sensors& s, float ry, float v) {
   const Leg& L = _cur();
-  const float sM = legMetres();
+  // where on the leg: the locked localizer (scaled to the table's metres) beats effort (log_031: effort 40 % ahead)
+  const bool lpOk = _lpOn && pathLocked() && _lp.leg() == _i && _lp.sEnd() > 0.5f;
+  const float sM = (lpOk && _lmkLen > 0) ? _lp.s() * _lmkLen / _lp.sEnd() : legMetres();
   const bool tilted = fabsf(s.pitchDeg() - _pitch0) > lmkTiltDeg;
-  const LandmarkLeg::Out o = _lmk.step(_scan, ry, L.ref, sM, 0.25f, tilted);
+  LandmarkLeg::Out o = _lmk.step(_scan, ry, L.ref, sM, 0.25f, tilted);
   _lmkWhy = o.why;
+  // the locked localizer at the end of the taught path ends a landmark leg too (like the path legs)
+  if (!o.done && lpOk && _lp.atEnd() && _eff >= pathEndMinFrac * L.effort) { o.done = true; o.why = "path end"; }
   // heading anchor (removes gyro drift): at most 0.5 deg per scan, like the wall legs
   if (o.dOff != 0) _off = _wrap(_off + _clamp(o.dOff, -0.5f, 0.5f));
-  if (o.done) { _nextLeg(s, o.why); return true; }
+  if (o.done) {
+    // a distance end only counts when the locked localizer agrees (same rule as the path legs); a STOP wall
+    // ("end wall reached") is physically there and always ends the leg
+    const bool distEnd = strcmp(o.why, "end wall reached") != 0 && strcmp(o.why, "entrance + stop distance") != 0;
+    if (!(distEnd && lpOk && _lp.s() < lpEndAgreeFrac * _lp.sEnd() - 0.5f)) { _nextLeg(s, o.why); return true; }
+    o.hold = true; o.why = "table end, localizer: not yet"; _lmkWhy = o.why;
+  }
   // last resort: far beyond the taught distance and still no end -> next leg (no endless drive)
-  if (_eff > lastResortFrac * L.effort + 2.0f) { _forced++; _nextLeg(s, "landmark leg: last resort"); return true; }
+  if (_eff > 2.5f * L.effort + 3.0f) { _forced++; _nextLeg(s, "landmark leg: last resort"); return true; }
+  // HOLD phase (no landmark planned): the taught path when the localizer is locked and matches well, else the course
+  _lmkPath = o.hold && lpOk && _lp.score() >= minPathScore;
+  if (_lmkPath) {
+    const float pe = _pathErrRad() * RAD_TO_DEG;
+    if (!_peInit) { _peF = pe; _peInit = true; }
+    _peF = _wrap(_peF + 0.6f * _wrap(pe - _peF));
+    _yawDesInit = false;
+    _drive(_peF, v, true);
+    return false;
+  }
+  _peInit = false;
   if (!_yawDesInit) { _yawDesF = o.yawDes; _yawDesInit = true; }
   _yawDesF = _wrap(_yawDesF + 0.5f * _wrap(o.yawDes - _yawDesF));   // same light smoothing as the wall legs
   _drive(_wrap(_yawDesF - ry), v, true);   // nose frame like ref: the taught lineOff already holds the crab
@@ -828,7 +868,7 @@ bool RouteFollow::_rearFree(const Sensors& s) const {
 
 void RouteFollow::_tacStart(uint8_t t, const Sensors& s, uint32_t now, bool first) {
   if (first) { _tkNext = 1; _tkCycles = 0; }
-  _tk = t; _tkMs = _tkWinMs = now; _tkYaw = s.yawNowDeg(); _shiftM = 0;
+  _tk = t; _tkMs = _tkWinMs = now; _tkYaw = s.yawNowDeg(); _shiftM = 0; _tkBoosted = false;
   // shifts alternate: back when the rover is already ahead of where the turn began (or forward is not allowed),
   // forward when it is behind -> it stays within +-fwdMoveStartM / backShiftMaxM of its start (log_031: two back
   // shifts used up the back allowance, after that only the locked pivot was left)
@@ -868,10 +908,15 @@ void RouteFollow::_tactic(const Sensors& s, float dt, uint32_t now) {
     return true;
   };
   switch (_tk) {
-    case TK_PIVOT:
-      _l = -turnCmd * d; _r = turnCmd * d;
+    case TK_PIVOT: {
+      // 11.11.: Kethan's Turn-90 (cas_box_kethan_log): 0 -> 0.35 in 1 s (MotorShaper wUp 0.35/s), kept while it turns
+      // >= 1 deg per 2 s; no response -> raised to turnCmd (0.50) for one more window, then the next tactic
+      const float pc = _tkBoosted ? turnCmd : kethanCmd;
+      _l = -pc * d; _r = pc * d;
       stalled = window(2500, 2000, 1.0f);
+      if (stalled && !_tkBoosted) { _tkBoosted = true; _tkWinMs = now; _tkYaw = yaw; stalled = false; }
       break;
+    }
     case TK_SWING:
       if (!fwdOk) { stalled = true; break; }
       if (d > 0) { _l = 0; _r = turnCmd; } else { _l = turnCmd; _r = 0; }
@@ -918,7 +963,7 @@ void RouteFollow::_startTurnStep(const Sensors& s, float ry, uint32_t now) {
     snprintf(_msg, sizeof(_msg), "start: turning %.0f deg (step %u)", _clamp(e, -90.0f, 90.0f), (unsigned)(_startRounds + 1));
   }
   const float e = _wrap(_stepTgt - ry);
-  if (fabsf(e) >= turnDoneDeg || _pivoting) {
+  if (fabsf(e) >= startDoneDeg || _pivoting) {
     if (now - _stateMs > startTurnTimeoutMs) {
       pause("start: cannot turn - turn by hand, Resume");
       _startTurn = false;
@@ -949,7 +994,9 @@ void RouteFollow::_startTurnStep(const Sensors& s, float ry, uint32_t now) {
   Serial.printf("[route] start check %u: %s, %.0f deg off the leg, score %.2f (2nd %.2f)\n", (unsigned)_startRounds,
                 ok ? "OK" : "not sure (gyro kept)", rest, sc, sec);
   _alignSc = sc; _alignSec = sec; _alignDeg = rest;
-  if (fabsf(rest) > turnDoneDeg && _startRounds < startMaxRounds) { _stepTgt = NAN; _stateMs = now; return; }
+  // up to startDoneDeg off: drive - the rolling heading hold (curve, inner wheel >= 50 %) takes the rest; a 0.35 pivot
+  // coasts ~10-14 deg and cannot make a small correction without overshooting (sim: endless re-checks)
+  if (fabsf(rest) > startDoneDeg && _startRounds < startMaxRounds) { _stepTgt = NAN; _stateMs = now; return; }
   _startTurn = false;
   _state = DRIVE; _stateMs = now;
   snprintf(_msg, sizeof(_msg), "leg %u: %s", (unsigned)(_i + 1), L.name);

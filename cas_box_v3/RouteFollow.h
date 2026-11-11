@@ -184,8 +184,8 @@ public:
   // rolling heading hold (05.11., Kethan's steerForward - it drove log_025 straight, hold error < 2.3 deg)
   float hKp = 0.045f;         // wheel difference per deg of error
   float hKd = 0.0015f;        // per deg/s of yaw rate (damping)
-  float corrMax = 0.10f;      // |wheel difference / 2| limit
-  float corrFrac = 0.40f;     // ... and at most this share of the speed
+  float corrMax = 0.125f;     // |wheel difference / 2| limit (11.11.: 0.10 -> 0.125, Kethan's curve: inner wheel 50 %)
+  float corrFrac = 0.50f;     // ... and at most this share of the speed (0.40 -> 0.50 = inner wheel at 50 %)
   float corrRate = 0.30f;     // the correction changes by at most this per second
   float pivotCoastS = 0.45f;  // pivot released |rate| * this early (rover lag + MotorShaper turn ramp-down)
   float pivotDoneDeg = 5.0f;  // pivot ends inside this (the rolling PD does the rest)
@@ -220,12 +220,16 @@ public:
   float driveSeconds() const { return _driveS; }
   // TURN TACTICS (v3, 11.11. after log_030 - see RouteFollow.cpp): pivot full power, swing, shift, arc in a cycle
   bool turnTactics = true;            // false = the old soft pivot 0.35 -> 0.50 + swing
-  float turnCmd = 0.50f;              // wheel command of pivot / swing / arc (outer wheels)
+  float turnCmd = 0.50f;              // wheel command of swing / arc, and of the pivot when 0.35 does not turn it
+  float kethanCmd = 0.35f;            // pivot first at Kethan's 0.35 (ramped 0 -> 0.35 in 1 s)
+  float climbPow = 0.40f;             // stuck: push straight at this first (no steering), climbMs long
+  uint32_t climbMs = 3000;            // (the 2 s S-curve speed ramp needs ~2 s to reach climbPow)
   uint32_t turnTacticTimeoutMs = 60000;   // a turn may take this long before it gives up (start: PAUSE)
   float backShiftMaxM = 0.6f;         // backward shifts in total per turn (no drop sensor behind the rover)
   float fwdMoveMaxM = 1.5f;           // forward rolling (swing / shift / arc) in total per turn on the route
   float fwdMoveStartM = 0.6f;         // ... in the start turn (raised path at M1, edge not visible to the LiDAR)
   uint8_t startMaxRounds = 4;
+  float startDoneDeg = 15.0f;         // start turn: this close to the leg direction after a check = drive
   uint32_t startTurnTimeoutMs = 150000;   // start turn: give up (PAUSE, turn by hand) after this (log_031: ~5 deg per shift)
   // a locked path localizer must agree that the leg is (nearly) done: s >= lpEndAgreeFrac * sEnd - 0.5 m (log_031)
   float lpEndAgreeFrac = 0.85f;         // start alignment: turn steps (<= 90 deg each) + LiDAR re-checks
@@ -238,7 +242,9 @@ public:
   float alignSecond() const { return _alignSec; }
   // LANDMARK LEGS (LandmarkLeg.h): leg i is driven on landmark lines (phases by distance) instead of
   // the taught-path match. Up to 4 legs. lmkMPerEff = metres per unit of effort (log_027: 1.03).
-  bool setLandmarkLeg(uint8_t legIdx, const LmkPhase* ph, uint8_t n);
+  // lenM = the leg length in the table's metres (teaching odometer); > 0: while the localizer is locked the phase
+  // position is the localizer's s scaled to it (effort can be 40 % off: log_031), else effort metres
+  bool setLandmarkLeg(uint8_t legIdx, const LmkPhase* ph, uint8_t n, float lenM = 0);
   float lmkMPerEff = 1.03f;
   float lmkTiltDeg = 3.5f;            // pitch off the start level by more: lines not trusted (ramp)
   bool onLmkLeg() const { return active() && _lmkOn; }
@@ -368,7 +374,9 @@ private:
   uint32_t _dropMs = 0;
   bool _vetoLogged = false;
   float _settleYaw = 0;
-  bool _shiftBack = false, _floorOk = false, _startTurn = false;
+  bool _shiftBack = false, _floorOk = false, _startTurn = false, _tkBoosted = false;
+  uint8_t _climbN = 0;
+  uint32_t _climbUntil = 0;
   uint8_t _startRounds = 0;
   char _tacMsg[32] = "";
   bool _floorAhead(const Sensors& s);
@@ -379,8 +387,11 @@ private:
   LandmarkLeg _lmk;
   bool _lmkOn = false;
   const char* _lmkWhy = "";
-  struct LmkSlot { uint8_t leg; const LmkPhase* ph; uint8_t n; };
-  LmkSlot _lmkSlot[4] = {{255, nullptr, 0}, {255, nullptr, 0}, {255, nullptr, 0}, {255, nullptr, 0}};
+  struct LmkSlot { uint8_t leg; const LmkPhase* ph; uint8_t n; float lenM; };
+  LmkSlot _lmkSlot[16];
+  uint8_t _lmkN = 0;
+  float _lmkLen = 0;
+  bool _lmkPath = false;              // last step steered on the taught path (HOLD phase / after the end)
   void _lmkBegin();
   bool _lmkDrive(const Sensors& s, float ry, float v);
 };

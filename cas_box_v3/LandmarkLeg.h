@@ -24,7 +24,10 @@
 //            Crowd rule (v10): the line must be >= minLen long (a person is ~0.5 m, a group of 5 in a
 //            row is not straight to 12 cm), seen in 3 of the last 5 scans, and fixed in space:
 //            d + s stays within 0.4 m (people walking towards the rover fail this).
-//   HOLD     no landmark: hold the course (route yaw = gyro + offset).
+//   HOLD     no landmark: hold the course (route yaw = gyro + offset); RouteFollow uses the taught path here
+//            when its localizer is locked (Out::hold).
+//   CENTER   (11.11.) both side lines: stay in the middle, e = (dL - dR) / 2 (+ = too far right of the middle...
+//            see .cpp); only the left line: keep it at dRef; only the right line: keep it at a (taught right distance).
 // No valid line in a phase -> HOLD for that scan (the gyro bridges gaps of a few seconds).
 // A phase ends at s >= sTo (or its event); after the last phase the leg ends ("distance end").
 //
@@ -57,12 +60,13 @@ struct LmkPhase {
 
 class LandmarkLeg {
 public:
-  enum Type : uint8_t { HOLD = 0, ANCHOR = 1, SIDE = 2, EDGE = 3, CORRIDOR = 4, ENTRANCE = 5, STOP = 6 };
+  enum Type : uint8_t { HOLD = 0, ANCHOR = 1, SIDE = 2, EDGE = 3, CORRIDOR = 4, ENTRANCE = 5, STOP = 6, CENTER = 7 };
   struct Out {
     float yawDes = 0;    // route yaw to steer to
     float dOff = 0;      // heading anchor correction for RouteFollow::_off (deg)
     bool line = false;   // a valid landmark line was used this scan
     bool done = false;   // leg finished
+    bool hold = false;   // HOLD phase (no landmark planned here): the caller may use the taught path instead
     const char* why = "";
   };
 

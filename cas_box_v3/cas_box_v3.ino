@@ -94,6 +94,7 @@ const bool USE_SAFETY_GUARD = true;       // false = drive commands go to the ro
 const bool START_ALIGN = true;            // false = old start (rover parallel to the wall)
 const uint8_t OPEN_SEA_LEG = 2;           // route leg driven on landmarks (kOpenSea), 0 = off
 const uint8_t BLOCK_I_LEG = 0;            // last leg to Block I (kBlockI), 0 = off (not taught yet)
+const bool LMK_LEGS_6_15 = true;          // legs 6-15 on landmark lines (LandmarkRoute.h kLmkLegs), false = taught path
 const bool MISSION_QUIET = true;          // phone off the Wi-Fi while the mission runs, double tap = back on
 // Wheel trim start value (learned on from here while rolling straight). Rover 7: +0.25 (Arjun, campus_10.3; his
 // learning then added up to +0.30 more). Rover 4: -0.046. + = right wheel faster.
@@ -174,6 +175,9 @@ void setup() {
   mission.route.trim = ROVER_TRIM_START;
   if (OPEN_SEA_LEG) mission.route.setLandmarkLeg(OPEN_SEA_LEG - 1, kOpenSea, LMK_COUNT(kOpenSea));
   if (BLOCK_I_LEG) mission.route.setLandmarkLeg(BLOCK_I_LEG - 1, kBlockI, LMK_COUNT(kBlockI));
+  // 11.11. (log_032): legs 6-15 (ramp M51-M57 and the open area M57-M72) on landmark lines, tables from log_027
+  if (LMK_LEGS_6_15)
+    for (const LmkLegReg& g : kLmkLegs) mission.route.setLandmarkLeg(g.leg - 1, g.ph, g.n, g.lenM);
   mission.needHeartbeat = !MISSION_QUIET;   // the mission must run without the phone
   radio.quietOnMission = MISSION_QUIET;
   radio.begin(hmi.server());
@@ -229,7 +233,7 @@ void loop() {
   shaper.boost = mission.active() ? mission.route.boost() : 0.0f;   // no progress on rough ground: more
   // v3 (log_030): turn tactics need full turn power quickly (Arjun: pivots worked 36 % with full power at once,
   // 13 % with a slow ramp) - 0 -> 0.50 in 0.25 s while a tactic turn runs; the stop ramp stays gentle (wDown)
-  shaper.wUp = mission.active() && mission.route.tacticActive() ? 2.0f : 0.35f;
+  shaper.wUp = 0.35f;   // 11.11.: Kethan's turn ramp for every pivot (0 -> 0.35 in 1 s; was 0.25 s to 0.50)
   shaper.apply(l, r, safetyReason != SafetyGuard::OK);   // gradual; a guard stop (obstacle / tilt) drops the speed at once
 
   rover.setDrive(l, r);                 // every loop pass, after guard and shaper

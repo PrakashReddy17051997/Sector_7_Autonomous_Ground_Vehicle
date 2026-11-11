@@ -51,7 +51,10 @@ int main(int argc, char** argv) {
     const float dist = fabsf(v)*dt; moved += dist; if (v>0) fwd += dist; else back += dist;
     float rate = 0;
     static float sinceUnlock = 0, credit = 0;
-    if (unlockM < 50) {                                    // "lock" model of log_031
+    if (unlockM >= 900) {                                  // free ground: a pivot >= 0.30 turns 40 deg/s at 0.5
+      if (fabsf(v) < 0.05f && fabsf(w) >= 0.30f) rate = 40.0f * (w / 0.5f);
+      else if (fabsf(v) >= 0.05f) rate = 35.0f * w;
+    } else if (unlockM < 50) {                             // "lock" model of log_031
       sinceUnlock += dist;
       if (sinceUnlock >= 0.2f) { credit = unlockM; sinceUnlock = 0; }   // unlockM = degrees of pivot per shift
       if (fabsf(v) < 0.05f && fabsf(w) >= 0.40f && credit > 0) { rate = 40.0f * (w / 0.5f); credit -= fabsf(rate) * dt; }

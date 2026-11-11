@@ -3,10 +3,10 @@
 using LineFeat::wrap180;
 
 const char* LandmarkLeg::typeName() const {
-  static const char* kNames[] = {"hold", "anchor", "side PID", "edge", "corridor", "entrance", "stop wall"};
+  static const char* kNames[] = {"hold", "anchor", "side PID", "edge", "corridor", "entrance", "stop wall", "center"};
   if (!_ph || _p >= _n) return "end";
   const uint8_t t = _ph[_p].type;
-  return t <= STOP ? kNames[t] : "?";
+  return t <= CENTER ? kNames[t] : "?";
 }
 
 LineFeat::Line LandmarkLeg::_line(const uint16_t* scan, float footExp, float dMin, float dMax, float minLen) const {
@@ -44,7 +44,7 @@ LandmarkLeg::Out LandmarkLeg::step(const uint16_t* scan, float ry, float ref, fl
   while (_p < _n && s >= _ph[_p].sTo && !(_ph[_p].type == ENTRANCE && _sStop >= 0)) { _p++; _resetPhase(); }
   if (_p >= _n) { _done = true; o.done = true; o.why = "distance end"; return o; }
   const LmkPhase& P = _ph[_p];
-  if (s < P.sFrom || P.type == HOLD) { _dPrev = -1; o.why = "hold"; return o; }
+  if (s < P.sFrom || P.type == HOLD) { _dPrev = -1; o.hold = true; o.why = "hold"; return o; }
   if (tilted) { _dPrev = -1; _gap(o, ref, dt); o.why = "on slope: hold"; return o; }
 
   const LineFeat::Line L = _line(scan, P.footExp, P.dMin, P.dMax, P.minLen);
@@ -100,6 +100,33 @@ LandmarkLeg::Out LandmarkLeg::step(const uint16_t* scan, float ry, float ref, fl
         uint8_t k = 0; for (uint8_t q = 0; q < 5; q++) k += (_evtN >> q) & 1;
         if (k >= 3) { _p++; _resetPhase(); o.why = "corridor found"; }
       }
+      return o;
+    }
+
+    case CENTER: {
+      // left line = this phase's line (footExp +90, dRef = taught left distance), right line looked up here
+      // (taught right distance in a). Both: middle of the corridor; one: keep its taught distance; none: hold.
+      const LineFeat::Line R = _line(scan, -90.0f, 0.3f, P.a + 1.5f, P.minLen);
+      const float rYaw = wrap180(ry - wrap180(-90.0f - R.foot));
+      const bool rOk = R.ok && fabsf(wrap180(rYaw - refLine)) <= P.paraDeg;
+      float e; float course;
+      if (ok && rOk) {                       // + e = closer to the right wall than the middle -> steer left
+        e = 0.5f * ((L.d - R.d) - (P.dRef - P.a));    // taught asymmetry kept (the taught track was not centred)
+        course = wrap180(courseFromLine + 0.5f * wrap180(wrap180(rYaw - P.lineOff) - courseFromLine));   // mean of both
+        o.why = "center: both walls";
+      } else if (ok) {
+        e = L.d - P.dRef; course = courseFromLine; o.why = "center: left wall";
+      } else if (rOk) {
+        e = P.a - R.d; course = wrap180(rYaw - P.lineOff); o.why = "center: right wall";
+      } else { _dPrev = -1; _gap(o, ref, dt); o.why = "center: no wall"; return o; }
+      _lastD = e + 100.0f;                   // (_pid's D term takes _dPrev >= 0 as "has a previous value")
+      _turn = _pid(e, dt, P.satDeg, P);      // + = turn left (towards the left wall / away from the right)
+      _dPrev = e + 100.0f;
+      _lastE = e;
+      o.yawDes = wrap180(course + _turn);
+      o.line = true;
+      _onHit(o, ref);
+      if (P.anchorGain > 0) o.dOff = P.anchorGain * wrap180(ref - course);
       return o;
     }
 
