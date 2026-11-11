@@ -102,7 +102,7 @@ bool RouteFollow::start(const Sensors& s, const WallFollow& wf, uint8_t i, float
   _lmkBegin();
   // v3: facing off the leg -> first turn on the spot (TURN state, gyro-closed soft pivot), then drive
   _state = (aligned && fabsf(_alignDeg) > turnDoneDeg) ? TURN : DRIVE;
-  _startTurn = _state == TURN; _startRounds = 0; _stepTgt = NAN; _settleMs = 0; _backShiftM = 0;
+  _startTurn = _state == TURN; _startRounds = 0; _stepTgt = NAN; _settleMs = 0; _netM = 0;
   _stateMs = _lastStep = millis();
   if (_state == TURN) snprintf(_msg, sizeof(_msg), "start: facing %.0f deg off - turning", _alignDeg);
   else snprintf(_msg, sizeof(_msg), "leg %u: %s", (unsigned)(i + 1), L.name);
@@ -286,7 +286,7 @@ void RouteFollow::_control(const Sensors& s) {
   // ---- soft pivot
   if (!_pivoting && (ae >= pivotDeg || (!_tgtFwd && ae > turnDoneDeg))) {
     _pivoting = true; _pivotMs = now; _tapDir = dir; _hc = 0; _pivBoost = 0;
-    if (turnTactics) { _fwdM = 0; _backShiftM = 0; _tacStart(TK_PIVOT, s, now, true); }
+    if (turnTactics) { _netM = 0; _tacStart(TK_PIVOT, s, now, true); }
   }
   if (_pivoting) {
     const float coast = fminf(7.0f, fabsf(_rate) * pivotCoastS);   // still turns this much after the release
@@ -385,7 +385,7 @@ void RouteFollow::_nextLeg(const Sensors& s, const char* how) {
   _i++;
   _loc.beginLeg(_i);
   _eff = 0; _I = 0; _seen = _lostN = _foundN = _frN = 0; _lowN = 0; _pivoting = false; _yawDesInit = false;
-  _avTries = 0; _backups = 0; _stuckN = 0; _passEff = -99; _wN = 0;
+  _avTries = 0; _backups = 0; _stuckN = 0; _passEff = -99; _wN = 0; _vetoLogged = false;
   _lmkBegin();
   _state = TURN;
   _stateMs = millis();
@@ -684,6 +684,18 @@ void RouteFollow::_step(const Sensors& s, const WallFollow& wf) {
       }
       // ---- LiDAR end match (RouteLocalizer): compare the scan with the taught end scan of the leg
       _loc.endStep(_scan, L.effort > 0 ? _eff / L.effort : 0, gate);
+      // v3 (11.11., log_031): the LOCKED path localizer says the rover is clearly short of the taught path end ->
+      // no leg end by effort / end scan / scan dip. log_031 leg 6 ended on effort 17.0 (avoid moves and slip count as
+      // effort) while the localizer (score 0.6-0.9) said 10.5 of 17 m - leg 8 then turned 6 m early into the steps.
+      if (_lpOn && pathLocked() && _lp.leg() == _i && _lp.s() < lpEndAgreeFrac * _lp.sEnd() - 0.5f) {
+        if (!_vetoLogged && (_eff >= kEffortEnd * L.effort || _loc.dip())) {   // only when the old rule would have ended it
+          _vetoLogged = true;
+          Serial.printf("[route] leg %u: effort %.1f/%.1f but the localizer says %.1f of %.1f m - not the end yet\n",
+                        (unsigned)(_i + 1), _eff, L.effort, _lp.s(), _lp.sEnd());
+        }
+        if (autoAdvance && _eff > 2.5f * L.effort + 3.0f) { _forced++; _nextLeg(s, "path: effort last resort"); }
+        return;
+      }
       if (_pathSteer()) {   // path mode: the leg ends at the end of the taught path (see the top of _step)
                             // (yaw-only legs fall through: taught distance + LiDAR end-scan match below)
         if (autoAdvance && _eff > 2.5f * L.effort + 3.0f) { _forced++; _nextLeg(s, "path: effort last resort"); }
@@ -791,23 +803,25 @@ bool RouteFollow::_lmkDrive(const Sensors& s, float ry, float v) {
 //   PIVOT  full turnCmd (0.50) at once (MotorShaper turn ramp 0.25 s), kept while >= 1 deg per 2 s
 //   SWING  outer wheels full forward, inner wheels stand            (needs free way + floor ahead)
 //   SHIFT  roll 0.3 m straight (wheels onto other stones); forward if free + floor ahead, else BACK if the
-//          rear is free (LiDAR 150-210 deg > 0.8 m, back ultrasonic > 40 cm), at most backShiftMaxM in total
+//          rear is free (LiDAR 150-210 deg > 0.55 m, back ultrasonic > 40 cm); net within +fwd / -back limits
 //   ARC    outer wheels full forward, inner 0.15, max 6 s             (needs free way + floor ahead)
 //   cycle PIVOT, SWING, SHIFT, PIVOT, ARC, SHIFT ... with 0.5 s REST (zero) between two tactics.
 // "floor ahead" = the front-angled ultrasonic saw the ground (8-40 cm) within the last 1.5 s - it is the only
 // drop sensor (raised start path!). And all forward rolling in one turn together <= fwdMoveMaxM (start turn:
 // fwdMoveStartM), the arc at most 6 s (start: 2 s).
 bool RouteFollow::_floorAhead(const Sensors& s) {
-  // box 7 (log_030): flat ground reads 14-30 cm, but ~half the readings are 300 (no echo) - so "floor" = a ground
-  // reading (8-40 cm) within the last 1.5 s.
+  // box 7 (log_030/031): flat ground reads 14-30 cm, but MOST readings are 300 (no echo) - "floor seen" blocked
+  // every forward move in log_031. Now: 8-40 = floor, 300 / < 8 = unknown (allowed), 41-299 = an echo from further
+  // down = the ground may fall away (edge of the raised path) -> forward blocked for 1 s.
   const uint32_t now = millis();
   const int a = s.usCm(4);
-  if (a >= 8 && a <= 40) _floorMs = now ? now : 1;
-  return _floorMs != 0 && now - _floorMs < 1500;
+  if (a > 40 && a < Sensors::kUsMaxCm) _dropMs = now ? now : 1;
+  return !(_dropMs != 0 && now - _dropMs < 1000);
 }
 
 bool RouteFollow::_rearFree(const Sensors& s) const {
-  for (uint8_t i = 37; i <= 52; i++) { const uint16_t cm = s.lidarCm(i); if (cm > 25 && cm < 80) return false; }
+  // a 0.3 m back shift needs ~0.55 m (log_031: the operator stood 0.7 m behind -> 0.8 m blocked every back shift)
+  for (uint8_t i = 37; i <= 52; i++) { const uint16_t cm = s.lidarCm(i); if (cm > 25 && cm < 55) return false; }
   const int b = s.usCm(3);
   return !(b > 2 && b < 40);
 }
@@ -815,8 +829,14 @@ bool RouteFollow::_rearFree(const Sensors& s) const {
 void RouteFollow::_tacStart(uint8_t t, const Sensors& s, uint32_t now, bool first) {
   if (first) { _tkNext = 1; _tkCycles = 0; }
   _tk = t; _tkMs = _tkWinMs = now; _tkYaw = s.yawNowDeg(); _shiftM = 0;
-  if (t == TK_SHIFT) _shiftBack = !(_corridor(s, 0, 0.25f, 1.5f) > 1.0f && _floorAhead(s) &&
-                                     _fwdM < (_startTurn ? fwdMoveStartM : fwdMoveMaxM));
+  // shifts alternate: back when the rover is already ahead of where the turn began (or forward is not allowed),
+  // forward when it is behind -> it stays within +-fwdMoveStartM / backShiftMaxM of its start (log_031: two back
+  // shifts used up the back allowance, after that only the locked pivot was left)
+  if (t == TK_SHIFT) {
+    const bool fwdRoom = _corridor(s, 0, 0.25f, 1.5f) > 1.0f && _floorAhead(s) && _netM < (_startTurn ? fwdMoveStartM : fwdMoveMaxM) - 0.25f;
+    const bool backRoom = _rearFree(s) && -_netM < backShiftMaxM - 0.25f;
+    _shiftBack = (_netM > 0.05f && backRoom) || !fwdRoom;     // back if ahead (and possible), else forward if possible
+  }
   static const char* kN[] = {"-", "pivot", "swing", "shift", "arc", "rest"};
   if (t != TK_REST) {
     snprintf(_tacMsg, sizeof(_tacMsg), "turn: %s%s", kN[t], t == TK_SHIFT ? (_shiftBack ? " back" : " fwd") : "");
@@ -826,13 +846,18 @@ void RouteFollow::_tacStart(uint8_t t, const Sensors& s, uint32_t now, bool firs
 
 void RouteFollow::_tactic(const Sensors& s, float dt, uint32_t now) {
   static const uint8_t kSeq[] = {TK_PIVOT, TK_SWING, TK_SHIFT, TK_PIVOT, TK_ARC, TK_SHIFT};
+  // start turn (log_031 at M1: a pivot gave ~5 deg right after each shift, then locked again; swing / arc gave ~1 deg
+  // and used up the forward room): only pivot <-> shift, the shifts alternating forward / back around the start point
+  static const uint8_t kSeqStart[] = {TK_PIVOT, TK_SHIFT};
+  const uint8_t* seq = _startTurn ? kSeqStart : kSeq;
+  const uint8_t nSeq = _startTurn ? sizeof(kSeqStart) : sizeof(kSeq);
   const float d = _tapDir;                                   // + = turn left
   const float yaw = s.yawNowDeg();
   const float moved = fabsf(_wrap(yaw - _tkYaw));
   _floorOk = _floorAhead(s);
-  if (dt > 0 && dt < 0.1f && _outV > 0) _fwdM += _outV * dt;            // forward rolling in this turn (1 m/s per unit)
+  if (dt > 0 && dt < 0.1f) _netM += _outV * dt;                         // signed rolling in this turn (1 m/s per unit)
   const float fwdMax = _startTurn ? fwdMoveStartM : fwdMoveMaxM;
-  const bool fwdOk = _corridor(s, 0, 0.25f, 1.5f) > 1.0f && _floorOk && _fwdM < fwdMax;
+  const bool fwdOk = _corridor(s, 0, 0.25f, 1.5f) > 1.0f && _floorOk && _netM < fwdMax;
   _why = WHY_TAP;
   _l = _r = 0;
   bool stalled = false;
@@ -858,24 +883,20 @@ void RouteFollow::_tactic(const Sensors& s, float dt, uint32_t now) {
       stalled = window(3000, 2000, 3.0f) || now - _tkMs > (_startTurn ? 2000u : 6000u);
       break;
     case TK_SHIFT: {
-      const bool ok = _shiftBack ? (_rearFree(s) && _backShiftM < backShiftMaxM) : fwdOk;
-      if (!ok || _shiftM >= 0.30f || now - _tkMs > 3500) { stalled = true; break; }
+      const bool ok = _shiftBack ? (_rearFree(s) && -_netM < backShiftMaxM) : fwdOk;
+      if (!ok || _shiftM >= 0.30f || now - _tkMs > 4500) { stalled = true; break; }
       const float v = _shiftBack ? -0.20f : 0.25f;
       _l = _r = v;
-      if (dt > 0 && dt < 0.1f) {
-        const float m = fabsf(_outV) * dt;                   // 1 m/s per unit (LocalLocalizer kSpeed)
-        _shiftM += m;
-        if (_shiftBack) _backShiftM += m;
-      }
+      if (dt > 0 && dt < 0.1f) _shiftM += fabsf(_outV) * dt;
       break;
     }
     default:                                                 // REST: wheels to zero, then the next tactic
       if (now - _tkMs >= 500 && fabsf(_outV) < 0.02f && fabsf(_outW) < 0.02f) {
-        if (_tkNext >= sizeof(kSeq)) { _tkNext = 0; _tkCycles++; }
+        if (_tkNext >= nSeq) { _tkNext = 0; _tkCycles++; }
       // forward rolling not allowed / used up: skip swing + arc (pivot and the back shift remain)
-      if (!(_corridor(s, 0, 0.25f, 1.5f) > 1.0f && _floorAhead(s) && _fwdM < (_startTurn ? fwdMoveStartM : fwdMoveMaxM)))
-        while (kSeq[_tkNext % sizeof(kSeq)] == TK_SWING || kSeq[_tkNext % sizeof(kSeq)] == TK_ARC) _tkNext = (_tkNext + 1) % sizeof(kSeq);
-        _tacStart(kSeq[_tkNext++], s, now, false);
+      if (!(_corridor(s, 0, 0.25f, 1.5f) > 1.0f && _floorAhead(s) && _netM < (_startTurn ? fwdMoveStartM : fwdMoveMaxM)))
+        while (seq[_tkNext % nSeq] == TK_SWING || seq[_tkNext % nSeq] == TK_ARC) _tkNext = (_tkNext + 1) % nSeq;
+        _tacStart(seq[_tkNext++], s, now, false);
       }
       return;
   }
@@ -898,7 +919,7 @@ void RouteFollow::_startTurnStep(const Sensors& s, float ry, uint32_t now) {
   }
   const float e = _wrap(_stepTgt - ry);
   if (fabsf(e) >= turnDoneDeg || _pivoting) {
-    if (now - _stateMs > turnTacticTimeoutMs) {
+    if (now - _stateMs > startTurnTimeoutMs) {
       pause("start: cannot turn - turn by hand, Resume");
       _startTurn = false;
       return;

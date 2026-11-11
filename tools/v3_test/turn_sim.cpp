@@ -1,6 +1,3 @@
-// Build: see tools/replay_fw/build.sh - copy the route sources + tools/replay_fw/stub/*.h into build/, add
-//   int usCm(uint8_t i) const { return i < 5 ? _us[i] : 300; } int _us[5];  to stub Sensors.h, then
-//   c++ -O2 -std=gnu++17 -Ibuild turn_sim.cpp build/RouteFollow.cpp build/RouteLocalizer.cpp build/LocalLocalizer.cpp build/LandmarkLeg.cpp
 // Closed-loop start-turn test: real RouteFollow (box code) + a rover that LOCKS on the spot like log_030.
 //   ./turn_sim <startOffDeg> <unlockAfterM> [floorEvery]   unlockAfterM: pivots work only after the wheels moved this far
 #include "RouteFollow.h"
@@ -18,13 +15,15 @@ int main(int argc, char** argv) {
   const float off0 = atof(argv[1]), unlockM = atof(argv[2]);
   const int floorEvery = argc > 3 ? atoi(argv[3]) : 2;      // 1 of N ultrasonic readings sees the floor
   // log_030 start scan (row 8): the rover stood at M1, 77 deg off. Re-centre it to "on the leg" first:
-  std::ifstream f("/tmp/claude-0/l30/log_030.csv"); std::string line; std::getline(f, line);
+  std::ifstream f(getenv("LOG") ? getenv("LOG") : "/tmp/claude-0/l30/log_030.csv"); std::string line; std::getline(f, line);
   std::vector<std::string> hdr; { std::stringstream ss(line); std::string c; while (std::getline(ss,c,',')) hdr.push_back(c); }
   int l0=0; for (size_t i=0;i<hdr.size();i++) if (hdr[i]=="lidar_000") l0=i;
-  for (int k=0;k<9;k++) std::getline(f,line);
+  { int row = getenv("ROW") ? atoi(getenv("ROW")) : 9; for (int k=0;k<row;k++) std::getline(f,line); }
   std::vector<std::string> v; { std::stringstream ss(line); std::string c; while (std::getline(ss,c,',')) v.push_back(c); }
   uint16_t base[90]; for (int i=0;i<90;i++) base[i]=(uint16_t)atof(v[l0+i].c_str());
-  const float logOff = -83.0f;   // what alignSearch finds on this scan (box said -77: rover turned RIGHT of the leg)
+  float logOff = -83.0f;
+  { LocalLocalizer L; float x,y,th,b,s2; L.alignSearch(base, 0, 0.6f, x, y, th, b, s2); logOff = th * 57.29578f;
+    fprintf(stderr, "base scan: rover %.0f deg off the leg (score %.2f)\n", logOff, b); }
   Sensors s; WallFollow wf; RouteFollow rf;
   float yaw = 0;                 // gyro
   // world: heading of the rover relative to the leg = off0 + (yaw - 0)
@@ -39,8 +38,8 @@ int main(int argc, char** argv) {
   printf("start: %s | align %.0f deg score %.2f\n", rf.msg(), rf.alignDeg(), rf.alignScore());
   float oL=0,oR=0, moved=0, fwd=0, back=0;
   int usTick=0;
-  for (g_ms = 10; g_ms < 120000; g_ms += 10) {
-    if (g_ms % 250 == 0) { usTick++; s._us[4] = (usTick % floorEvery == 0) ? 16 : 300; }
+  for (g_ms = 10; g_ms < 200000; g_ms += 10) {
+    if (g_ms % 250 == 0) { usTick++; s._us[4] = (usTick % floorEvery == 0) ? 17 : 300; }
     float l, r; rf.steer(s, wf, l, r);
     // MotorShaper-like ramp: turn up fast while a tactic runs (2/s), forward 0.5/s, down 1/s
     const float tv=0.5f*(l+r), tw=0.5f*(r-l); float v=0.5f*(oL+oR), w=0.5f*(oR-oL);
@@ -51,13 +50,17 @@ int main(int argc, char** argv) {
     // rover: translation 1 m/s per unit; turn only if unlocked (moved far enough) and |w| >= 0.4 (pivot) or a swing/arc
     const float dist = fabsf(v)*dt; moved += dist; if (v>0) fwd += dist; else back += dist;
     float rate = 0;
-    if (moved >= unlockM) {
-      if (fabsf(v) < 0.05f && fabsf(w) >= 0.40f) rate = 40.0f * (w / 0.5f);        // pivot
-      else if (fabsf(v) >= 0.05f) rate = 35.0f * w;                                  // swing / arc / rolling
+    static float sinceUnlock = 0, credit = 0;
+    if (unlockM < 50) {                                    // "lock" model of log_031
+      sinceUnlock += dist;
+      if (sinceUnlock >= 0.2f) { credit = unlockM; sinceUnlock = 0; }   // unlockM = degrees of pivot per shift
+      if (fabsf(v) < 0.05f && fabsf(w) >= 0.40f && credit > 0) { rate = 40.0f * (w / 0.5f); credit -= fabsf(rate) * dt; }
+      else if (fabsf(v) >= 0.05f) rate = 4.0f * w;                         // rolling turns barely (log_031 arc: ~1 deg)
     }
     yaw = wrap(yaw + rate*dt);
     s._yaw = s._yawNow = yaw;
     if (g_ms % 250 == 0) setScan();
+    if (getenv("TRACE") && g_ms % 500 == 0 && g_ms < 40000) { int rm=999; for (int i=37;i<=52;i++) if (s._lidarCm[i]>25 && s._lidarCm[i]<rm) rm=s._lidarCm[i]; printf("  %5.1f %-16s cmd %5.2f %5.2f v %5.2f w %5.2f yaw %6.1f moved %.2f rearMin %d\n", g_ms/1000.0, rf.tacticActive()?rf.tacticMsg():"-", l, r, v, w, off0+yaw, moved, rm); }
     if (rf.state() == RouteFollow::DRIVE || rf.state() == RouteFollow::PAUSED || rf.state() == RouteFollow::DONE) {
       printf("t %.1f s: %s | state %u, heading off the leg %.1f deg, rolled fwd %.2f m back %.2f m | %s\n", g_ms/1000.0,
              rf.state()==RouteFollow::DRIVE?"DRIVING":"STOPPED", (unsigned)rf.state(), wrap(off0+yaw), fwd, back, rf.msg());

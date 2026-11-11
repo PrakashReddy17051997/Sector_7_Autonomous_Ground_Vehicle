@@ -225,7 +225,10 @@ public:
   float backShiftMaxM = 0.6f;         // backward shifts in total per turn (no drop sensor behind the rover)
   float fwdMoveMaxM = 1.5f;           // forward rolling (swing / shift / arc) in total per turn on the route
   float fwdMoveStartM = 0.6f;         // ... in the start turn (raised path at M1, edge not visible to the LiDAR)
-  uint8_t startMaxRounds = 4;         // start alignment: turn steps (<= 90 deg each) + LiDAR re-checks
+  uint8_t startMaxRounds = 4;
+  uint32_t startTurnTimeoutMs = 150000;   // start turn: give up (PAUSE, turn by hand) after this (log_031: ~5 deg per shift)
+  // a locked path localizer must agree that the leg is (nearly) done: s >= lpEndAgreeFrac * sEnd - 0.5 m (log_031)
+  float lpEndAgreeFrac = 0.85f;         // start alignment: turn steps (<= 90 deg each) + LiDAR re-checks
   bool tacticActive() const { return active() && _pivoting && turnTactics; }   // -> fast turn ramp in MotorShaper
   const char* tacticMsg() const { return _tacMsg; }
   bool alignStart = true;
@@ -361,8 +364,9 @@ private:
   enum Tac : uint8_t { TK_NONE = 0, TK_PIVOT = 1, TK_SWING = 2, TK_SHIFT = 3, TK_ARC = 4, TK_REST = 5 };
   uint8_t _tk = TK_NONE, _tkNext = 0, _tkCycles = 0, _floorH = 0;
   uint32_t _tkMs = 0, _tkWinMs = 0, _settleMs = 0;
-  float _tkYaw = 0, _shiftM = 0, _backShiftM = 0, _fwdM = 0, _stepTgt = NAN;
-  uint32_t _floorMs = 0;
+  float _tkYaw = 0, _shiftM = 0, _netM = 0, _stepTgt = NAN;
+  uint32_t _dropMs = 0;
+  bool _vetoLogged = false;
   float _settleYaw = 0;
   bool _shiftBack = false, _floorOk = false, _startTurn = false;
   uint8_t _startRounds = 0;
