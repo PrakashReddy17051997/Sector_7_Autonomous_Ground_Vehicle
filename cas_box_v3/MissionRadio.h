@@ -32,8 +32,21 @@ public:
   bool quietOnMission = true;        // false = old behaviour (phone stays connected)
   uint32_t postTapMs = 500;          // record this long after the tap, then write the file
 
+  // 11.11.: switched on the page (/radio?quiet=1|0), default from the sketch; onChange tells the sketch
+  void (*onChange)(bool quiet) = nullptr;
   void begin(AsyncWebServer* server) {
     if (!server) return;
+    server->on("/radio", HTTP_GET, [this](AsyncWebServerRequest* req) {
+      if (req->hasParam("quiet")) {
+        quietOnMission = req->getParam("quiet")->value().toInt() != 0;
+        if (onChange) onChange(quietOnMission);
+        Serial.printf("[radio] phone off during the mission: %s\n", quietOnMission ? "ON (demo)" : "OFF (test)");
+      }
+      req->send(200, "text/plain", quietOnMission ? "quiet" : "open");
+    });
+    server->on("/radio.json", HTTP_GET, [this](AsyncWebServerRequest* req) {
+      req->send(200, "application/json", String("{\"quiet\":") + (quietOnMission ? "true" : "false") + "}");
+    });
     server->on("/tap.csv", HTTP_GET, [this](AsyncWebServerRequest* req) {
       if (_lastFile[0] && LittleFS.exists(_lastFile)) req->send(LittleFS, _lastFile, "text/csv", true);
       else req->send(404, "text/plain", "no tap recording yet");

@@ -95,7 +95,12 @@ const bool START_ALIGN = true;            // false = old start (rover parallel t
 const uint8_t OPEN_SEA_LEG = 2;           // route leg driven on landmarks (kOpenSea), 0 = off
 const uint8_t BLOCK_I_LEG = 0;            // last leg to Block I (kBlockI), 0 = off (not taught yet)
 const bool LMK_LEGS_6_15 = true;          // legs 6-15 on landmark lines (LandmarkRoute.h kLmkLegs), false = taught path
-const bool MISSION_QUIET = true;          // phone off the Wi-Fi while the mission runs, double tap = back on
+const bool MISSION_QUIET = false;         // START value of the page switch "Phone OFF during the mission" (11.11.:
+                                          // off = tests with feedback; switch it on on the page for the demo)
+// 11.11.: rover 7 needs 0.5 to pivot - the pad turn keys and the Left/Right 90 buttons pivot at this,
+// ramped 0 -> 0.5 in 1 s (MotorShaper wUp 0.5/s), whatever the speed slider says
+const float PIVOT_CMD = 0.50f;
+const float TURN90_STOP_EARLY_MAX = 20.0f; // released this much early at most (it coasts on; Kethan: 14 at 0.35)
 // Wheel trim start value (learned on from here while rolling straight). Rover 7: +0.25 (Arjun, campus_10.3; his
 // learning then added up to +0.30 more). Rover 4: -0.046. + = right wheel faster.
 const float ROVER_TRIM_START = 0.25f;
@@ -112,6 +117,51 @@ WallFollow wall;      // autonomous LiDAR wall following (web card "Wall followi
 Mission mission;      // full-auto run: route B -> H leg by leg (RouteFollow, teach & repeat of log_009)
 MotorShaper shaper;   // dead band / pivot / breakaway compensation (the rover needs ~0.5 to start turning)
 MissionRadio radio;   // v3: phone off during the mission, double tap -> back on + IMU recording
+
+// ---- v3 (11.11.) Left / Right 90 (Kethan's turn90, cas_box_kethan_log, at 0.5 for rover 7) -------------------
+// gyro-controlled pivot of 90 deg: command PIVOT_CMD (ramped by MotorShaper), progress = gyro change, released when
+// the rest is smaller than what it still coasts (|rate| * 0.45 s, at most TURN90_STOP_EARLY_MAX); stops on: the
+// cancel button / any drive key, no IMU, 15 s, or less than 1 deg in 2 s at full command ("no turn response").
+volatile int8_t t90Req = 0; volatile bool t90New = false;
+char t90Msg[64] = "";
+struct Turn90 {
+  bool on = false; int8_t dir = 1; float prog = 0, prevYaw = 0, rate = 0, respProg = 0;
+  uint32_t t0 = 0, respMs = 0, lastMs = 0;
+} t90;
+static float wrap180f(float a) { a = fmodf(a + 180.0f, 360.0f); if (a < 0) a += 360.0f; return a - 180.0f; }
+void turn90Stop(const char* why) { t90.on = false; snprintf(t90Msg, sizeof(t90Msg), "%s (%.0f deg)", why, t90.prog); Serial.printf("[turn90] %s\n", t90Msg); }
+// returns true while it drives the wheels
+bool turn90Step(float padL, float padR, uint32_t padAge, float& l, float& r) {
+  const uint32_t now = millis();
+  if (t90New) {
+    t90New = false;
+    if (t90Req == 0) { if (t90.on) turn90Stop("cancelled"); }
+    else if (!sensors.imuOk()) { snprintf(t90Msg, sizeof(t90Msg), "no IMU - no turn"); }
+    else {
+      t90 = Turn90(); t90.on = true; t90.dir = t90Req; t90.t0 = t90.respMs = t90.lastMs = now; t90.prevYaw = sensors.yawNowDeg();
+      snprintf(t90Msg, sizeof(t90Msg), "%s 90: starting", t90.dir > 0 ? "Left" : "Right");
+    }
+  }
+  if (!t90.on) return false;
+  if (padAge <= PAD_TIMEOUT_MS && (padL != 0 || padR != 0)) { turn90Stop("drive key - cancelled"); return false; }
+  if (!sensors.imuOk()) { turn90Stop("IMU invalid - stopped"); return false; }
+  if (now - t90.t0 > 15000) { turn90Stop("15 s - stopped"); return false; }
+  const float y = sensors.yawNowDeg();
+  const float dy = wrap180f(y - t90.prevYaw);
+  const float dt = (now - t90.lastMs) / 1000.0f;
+  t90.prevYaw = y; t90.lastMs = now;
+  if (fabsf(dy) > 30) { turn90Stop("IMU jump - stopped"); return false; }
+  if (dt > 0 && dt < 0.2f) t90.rate = 0.8f * t90.rate + 0.2f * (dy / dt);
+  t90.prog += t90.dir * dy;
+  if (t90.prog < -5) { turn90Stop("turned the wrong way - stopped"); return false; }
+  const float coast = fminf(TURN90_STOP_EARLY_MAX, fabsf(t90.rate) * 0.45f);
+  if (t90.prog >= 90.0f - coast) { turn90Stop("done"); return false; }
+  if (t90.prog - t90.respProg >= 1.0f) { t90.respProg = t90.prog; t90.respMs = now; }
+  if (now - t90.respMs > 2000 && now - t90.t0 > 1500) { turn90Stop("no turn response - stopped"); return false; }
+  l = -t90.dir * PIVOT_CMD; r = t90.dir * PIVOT_CMD;
+  snprintf(t90Msg, sizeof(t90Msg), "%s 90: %.0f / 90 deg", t90.dir > 0 ? "Left" : "Right", t90.prog);
+  return true;
+}
 bool oledReady = false;
 char boxSsid[16], boxPassword[16];
 uint8_t safetyReason = SafetyGuard::OK;  // last guard decision, for the page
@@ -178,8 +228,18 @@ void setup() {
   // 11.11. (log_032): legs 6-15 (ramp M51-M57 and the open area M57-M72) on landmark lines, tables from log_027
   if (LMK_LEGS_6_15)
     for (const LmkLegReg& g : kLmkLegs) mission.route.setLandmarkLeg(g.leg - 1, g.ph, g.n, g.lenM);
-  mission.needHeartbeat = !MISSION_QUIET;   // the mission must run without the phone
+  mission.needHeartbeat = !MISSION_QUIET;   // phone off -> the mission must run without the page heartbeat
   radio.quietOnMission = MISSION_QUIET;
+  radio.onChange = [](bool q) { mission.needHeartbeat = !q; };
+  mission.route.kethanCmd = PIVOT_CMD;      // route pivots at 0.5 too (rover 7)
+  // Left / Right 90 buttons (page): d = 1 left, -1 right, 0 cancel
+  hmi.server()->on("/turn90", HTTP_GET, [](AsyncWebServerRequest* req) {
+    if (req->hasParam("d")) t90Req = (int8_t)constrain(req->getParam("d")->value().toInt(), -1, 1), t90New = true;
+    req->send(200, "text/plain", "ok");
+  });
+  hmi.server()->on("/turn90.json", HTTP_GET, [](AsyncWebServerRequest* req) {
+    req->send(200, "application/json", String("{\"msg\":\"") + t90Msg + "\"}");
+  });
   radio.begin(hmi.server());
 
   // Safety thresholds - change here if needed (defaults: see SafetyGuard.h)
@@ -213,9 +273,13 @@ void loop() {
   const float padL = l, padR = r;       // raw pad command (GpsNav needs it as dead-man switch)
   if (age > PAD_TIMEOUT_MS) l = r = 0;  // key released, page closed or phone gone
 
+  // 11.11.: pad turn keys (left/right on the spot) pivot at PIVOT_CMD - the slider's 0.30 does not turn rover 7
+  if (l * r < 0) { const float d = r > 0 ? 1.0f : -1.0f; l = -d * PIVOT_CMD; r = d * PIVOT_CMD; }
+
   // Full-auto mission (heartbeat from the page) - otherwise manual driving from the pad.
   mission.pollRequests(sensors, wall, nav);
-  if (mission.active()) mission.steer(sensors, wall, nav, padL, padR, age, l, r);
+  if (mission.active()) { if (t90.on) turn90Stop("mission started"); mission.steer(sensors, wall, nav, padL, padR, age, l, r); }
+  else turn90Step(padL, padR, age, l, r);   // Left / Right 90 buttons (manual only)
 
   const float cmdL = l, cmdR = r;       // what was asked for (logged)
   // ramp legs of the route: the LiDAR sees the ramp surface as a wall -> LiDAR stop off there
@@ -233,7 +297,7 @@ void loop() {
   shaper.boost = mission.active() ? mission.route.boost() : 0.0f;   // no progress on rough ground: more
   // v3 (log_030): turn tactics need full turn power quickly (Arjun: pivots worked 36 % with full power at once,
   // 13 % with a slow ramp) - 0 -> 0.50 in 0.25 s while a tactic turn runs; the stop ramp stays gentle (wDown)
-  shaper.wUp = 0.35f;   // 11.11.: Kethan's turn ramp for every pivot (0 -> 0.35 in 1 s; was 0.25 s to 0.50)
+  shaper.wUp = 0.50f;   // 11.11.: every pivot 0 -> 0.5 in 1 s (Kethan's 1 s ramp, rover 7 needs 0.5)
   shaper.apply(l, r, safetyReason != SafetyGuard::OK);   // gradual; a guard stop (obstacle / tilt) drops the speed at once
 
   rover.setDrive(l, r);                 // every loop pass, after guard and shaper
@@ -293,6 +357,7 @@ void loop() {
                   String(mission.route.crossTrack() * 100.0f, 0) + " cm (+ = left), I " + String(mission.route.xteI(), 1) +
                   " deg" + (mission.route.onRamp() ? ", ON RAMP" : ""));
     // v3
+    hmi.showValue("turn90", t90Msg);
     hmi.showValue("route.turn", String(mission.route.tacticActive() ? mission.route.tacticMsg() : "-") +
                   ", floor US " + String(sensors.usCm(4)) + " cm, back US " + String(sensors.usCm(3)) + " cm");
     hmi.showValue("route.trim", String(mission.route.trim, 3) + " (start " + String(ROVER_TRIM_START, 2) + ", " +

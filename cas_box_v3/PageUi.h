@@ -36,6 +36,33 @@ window.renderSensors=function(s){
      :"<tr><td class='k'>GPS</td><td colspan='5'>no data from the module</td></tr>";
   $('snTable').innerHTML=t;
 };
+// ---- v3 (11.11.): Left 90 / Right 90 buttons (gyro turn at 0.5 on the box), ■ or any drive key cancels
+const pad=document.querySelector('.pad');
+if(pad){
+  const row=document.createElement('div');row.style.cssText='display:flex;gap:8px;margin-top:8px';
+  row.innerHTML="<button class='btn' id='t90l' style='flex:1'>&#8634; Left 90&deg;</button>"+
+                "<button class='btn' id='t90r' style='flex:1'>Right 90&deg; &#8635;</button>";
+  pad.parentNode.insertBefore(row,pad.nextSibling);
+  const st=document.createElement('div');st.className='k';st.id='t90s';st.style.marginTop='4px';
+  row.parentNode.insertBefore(st,row.nextSibling);
+  $('t90l').onclick=()=>fetch('/turn90?d=1').catch(()=>{});
+  $('t90r').onclick=()=>fetch('/turn90?d=-1').catch(()=>{});
+  if(window.drvStop){const ds=window.drvStop;window.drvStop=function(){fetch('/turn90?d=0').catch(()=>{});ds();};}
+  setInterval(()=>fetch('/turn90.json').then(r=>r.json()).then(j=>{$('t90s').textContent=j.msg||'';}).catch(()=>{}),700);
+}
+// ---- v3 (11.11.): phone off the Wi-Fi during the mission - a switch (tests: off = feedback; demo: on)
+let rqTries=0;
+(function addRq(){
+  const mc=$('msInfo')?$('msInfo').closest('.card'):null;
+  if(!mc&&rqTries++<20){setTimeout(addRq,250);return;}   // the mission card comes from /mission.js
+  const host=mc||document.querySelector('.wrap');
+  if(!host||$('rq'))return;
+  const d=document.createElement('div');d.style.marginTop='8px';
+  d.innerHTML="<label><input type='checkbox' id='rq'> Phone OFF during the mission (demo) &ndash; double tap the box brings Wi-Fi back</label>";
+  host.appendChild(d);
+  fetch('/radio.json').then(r=>r.json()).then(j=>{$('rq').checked=!!j.quiet;}).catch(()=>{});
+  $('rq').onchange=e=>fetch('/radio?quiet='+(e.target.checked?1:0)).catch(()=>{});
+})();
 })();)rawjs";
 
 inline void registerPageUi(AsyncWebServer* server) {
