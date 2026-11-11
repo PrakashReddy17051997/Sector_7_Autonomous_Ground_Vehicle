@@ -31,6 +31,11 @@ class MotorShaper {
 public:
   float accelS = 2.0f;      // v3: speed up in this time (S-curve)
   float decelS = 2.0f;      // v3: slow down / stop in this time (S-curve)
+  // v4 (11.11.): FIRM stop - the route sets firm while it stops for an obstacle / backs up. With the 2 s S-curve
+  // the rover rolled ~0.3 m after the route asked to stop and hit a new obstacle that was seen at 0.45 m
+  // (tools/v4_test/obstacle_sim, scenario 1). Firm = slow down in firmDecelS (S-curve too, ~0.1 m from 0.30).
+  float firmDecelS = 0.6f;
+  bool firm = false;
   float fullStep = 0.25f;   // a speed change this big takes the full time; smaller ones take less (min 30 %)
   float vStart = 0.05f;     // (unused since v3)
   float riseS = 2.5f;       // vStart -> target speed in this time (linear)
@@ -73,9 +78,9 @@ public:
     if (hard) {
       _v = vT; _rTo = vT; _rFrom = vT; _rT = 0;                         // guard stop: at once
     } else {
-      if (fabsf(vT - _rTo) > 0.004f) {                                  // new target: ramp from where we are
+      if (fabsf(vT - _rTo) > 0.004f || (firm && fabsf(vT) < fabsf(_v) && _rDur > firmDecelS + 0.01f && _rT < _rDur)) {   // new target (or firm now): ramp from where we are
         _rFrom = _v; _rTo = vT; _rT = 0;
-        const float base = fabsf(vT) > fabsf(_v) ? accelS : decelS;
+        const float base = fabsf(vT) > fabsf(_v) ? accelS : (firm ? firmDecelS : decelS);
         _rDur = base * constrain(fabsf(vT - _v) / fullStep, 0.3f, 1.0f);
       }
       if (_rT < _rDur) {

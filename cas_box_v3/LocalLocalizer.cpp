@@ -299,7 +299,7 @@ void LocalLocalizer::step(const uint16_t* scanCm, float dyawRad, float effDelta,
     _project();
     const float offNow = _off;
     _pi = keep;
-    if ((_lost >= 8 || offNow > 1.0f) && n >= 20) _relocate(px, py, n);
+    if ((_lost >= 8 || offNow > relocOffM) && n >= 20) _relocate(px, py, n);
   }
   _project();
   if (_pi * kStep >= kLeg[_leg].sEnd - 0.25f) _atEnd = true;   // last leg too: route done
@@ -340,6 +340,30 @@ uint8_t LocalLocalizer::newPointsAhead(const uint16_t* scanCm, float half, float
     if (v < 6 && n < 255) n++;   // < 6/15: no taught wall within ~20 cm
   }
   return n;
+}
+
+float LocalLocalizer::newAhead(const uint16_t* scanCm, float half, float look, float* latM) const {
+  const Leg& L = kLeg[_leg];
+  const float c = cosf(_th), s = sinf(_th), lx = L.loX * 0.01f, ly = L.loY * 0.01f;
+  float b1 = 99, b2 = 99, l1 = 0, l2 = 0;
+  for (int i = 0; i < kN; i++) {
+    if (scanCm[i] <= 25) continue;
+    const float a = -(i * 4 + 2.0f) * kDeg, r = scanCm[i] / 100.0f;
+    const float al = r * cosf(a), la = r * sinf(a);
+    if (al <= 0.05f || al >= look || fabsf(la) >= half) continue;
+    const float wx = _x + c * al - s * la, wy = _y + s * al + c * la;
+    const int gi = (int)((wx - lx) / kRes), gj = (int)((wy - ly) / kRes);
+    int v = 0;
+    if (gi >= 0 && gi < L.nx && gj >= 0 && gj < L.ny) {
+      const uint32_t idx = (uint32_t)gi * L.ny + gj;
+      const uint8_t b = L.grid[idx >> 1];
+      v = (idx & 1) ? (b >> 4) : (b & 15);
+    }
+    if (v >= 6) continue;                       // a taught wall
+    if (al < b1) { b2 = b1; l2 = l1; b1 = al; l1 = la; } else if (al < b2) { b2 = al; l2 = la; }
+  }
+  if (latM) *latM = l2;
+  return b2;
 }
 
 float LocalLocalizer::headingErrorTo(float lookM) const {

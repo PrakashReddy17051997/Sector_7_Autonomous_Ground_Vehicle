@@ -9,6 +9,14 @@
 //      store front = side PID at 6.75 m, wall ahead = stop (LandmarkLeg.h, LandmarkRoute.h).
 //    - MISSION RADIO: phone off the Wi-Fi during the mission (rover link untouched), double tap on
 //      the box -> Wi-Fi open again + IMU recording /tap_NNN.csv with GPS clock (MissionRadio.h).
+//  v4 (2026-11-11, from v3 + the IMU/wall/obstacle work of 05.11.; STEP6_2026-11-11.md):
+//    - SMART OBSTACLES: new things on the locked path are seen from 1.5 m (v3: 0.45 m - with the 2 s S-curve
+//      stop the rover rolled into them); stop for an obstacle = FIRM (0.6 s); a moving one (person) is waited
+//      for, a static one is driven around at once (width from the LiDAR, free side, back to the line).
+//      Switch SMART_OBSTACLES below. Closed-loop test on the real route code: tools/v4_test/obstacle_sim.
+//    - v4b SMOOTH REROUTE: a static obstacle seen 1.2-3.5 m ahead is passed on a planned smooth curve (out, beside
+//      it, back onto the taught path) without stopping; re-checked every scan, falls back to stop + 45 deg detour.
+//      Switch: mission.route.smoothReroute (RouteFollow.h).
 // =============================================================================================
 //
 //  WHAT IT DOES
@@ -34,8 +42,8 @@
 //  START ORDER: switch on the box first, then the rover (the rover looks for its box only
 //    while it boots). Phone: join CAS-Box-<NN>, open the web page.
 //
-//  ARDUINO IDE: board "ESP32 Dev Module", ESP32 core 3.3.x, default partition scheme
-//    (the default scheme is needed: it holds the ~1.3 MB log storage).
+//  ARDUINO IDE: board "ESP32 Dev Module", ESP32 core 3.3.x, partition scheme "No OTA (2MB APP/2MB SPIFFS)"
+//    + Erase All Flash the first time (STEP5: v3/v4 are ~1.6 MB, more than the default 1.25 MB app partition).
 //    Required libraries and versions: README.md. Serial monitor: 115200 baud.
 //
 //  FILES
@@ -104,6 +112,11 @@ const float TURN90_STOP_EARLY_MAX = 20.0f; // released this much early at most (
 // Wheel trim start value (learned on from here while rolling straight). Rover 7: +0.25 (Arjun, campus_10.3; his
 // learning then added up to +0.30 more). Rover 4: -0.046. + = right wheel faster.
 const float ROVER_TRIM_START = 0.25f;
+// ---- v4 switch ---------------------------------------------------------------------------------------------------
+// SMART_OBSTACLES: early detection (1.5 m) of NEW things on the locked path + detour of static ones (RouteFollow
+// "SMART OBSTACLES"). false = the v3 handling (wait 3 s, sidestep). The FIRM stop for obstacles is on either way
+// (it is what keeps the rover from rolling into an obstacle after the 2 s S-curve).
+const bool SMART_OBSTACLES = true;
 
 // ---- objects ---------------------------------------------------------------------------------
 WebHMI hmi;           // web server + page
@@ -223,6 +236,7 @@ void setup() {
   // v3 settings
   mission.route.alignStart = START_ALIGN;
   mission.route.trim = ROVER_TRIM_START;
+  mission.route.smartAvoid = SMART_OBSTACLES;   // v4
   if (OPEN_SEA_LEG) mission.route.setLandmarkLeg(OPEN_SEA_LEG - 1, kOpenSea, LMK_COUNT(kOpenSea));
   if (BLOCK_I_LEG) mission.route.setLandmarkLeg(BLOCK_I_LEG - 1, kBlockI, LMK_COUNT(kBlockI));
   // 11.11. (log_032): legs 6-15 (ramp M51-M57 and the open area M57-M72) on landmark lines, tables from log_027
@@ -281,6 +295,7 @@ void loop() {
   if (mission.active()) { if (t90.on) turn90Stop("mission started"); mission.steer(sensors, wall, nav, padL, padR, age, l, r); }
   else turn90Step(padL, padR, age, l, r);   // Left / Right 90 buttons (manual only)
 
+  shaper.firm = mission.active() && mission.route.firmStop();   // v4: obstacle stop / back-up in 0.6 s, not 2 s
   const float cmdL = l, cmdR = r;       // what was asked for (logged)
   // ramp legs of the route: the LiDAR sees the ramp surface as a wall -> LiDAR stop off there
   // (front ultrasonic 25 cm and tilt stay on), see RouteFollow::rampLegs
@@ -340,6 +355,8 @@ void loop() {
   if (now - lastUi >= 500) {  // status line + values in the "Dev" view
     lastUi = now;
     String state = rover.statusText();
+    hmi.showValue("route.avoid", mission.route.avoidPhase() ? String("phase ") + mission.route.avoidPhase() + " (1 out, 2 pass, 3 back), " +
+                  mission.route.msg() : String("-"));
     if (safetyReason != SafetyGuard::OK) state = String(SafetyGuard::reasonText(safetyReason)) + " | " + state;
     if (mission.active()) state = "MISSION " + mission.statusText() + " | " + state;
     if (millis() < 120000 && resetReason != "power on" && !resetReason.startsWith("reset button"))

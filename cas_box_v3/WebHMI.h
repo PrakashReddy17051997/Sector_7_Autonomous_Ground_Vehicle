@@ -18,7 +18,7 @@
 
 class WebHMI {
 public:
-  static const uint8_t kMaxValues = 16;  // named values in the "Dev" view
+  static const uint8_t kMaxValues = 32;  // named values in the "Dev" view (v4: 16 -> 24; v3 now shows 24 names -> 32 for headroom)
 
   // Starts the access point (password min. 8 characters) and the web server.
   void begin(const char* ssid, const char* pass, IPAddress ip, uint8_t channel);

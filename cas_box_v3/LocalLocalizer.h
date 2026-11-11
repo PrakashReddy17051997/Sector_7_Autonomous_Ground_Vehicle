@@ -26,6 +26,7 @@ public:
   static const uint8_t kN = 90;
   float kSpeed = 1.0f;          // m/s per forward command (LiDAR-measured, log_012)
   float accept = 0.35f, acceptReloc = 0.45f;
+  float relocOffM = 1.0f;       // further off the taught path -> relocate onto it (v4: RouteFollow widens it during a detour)
   float thPrior = 40.0f;        // score per rad^2 of heading change against the gyro (2 deg = 0.05, 4 deg = 0.2)
 
   bool hasMap() const;
@@ -76,6 +77,9 @@ public:
   // points in the corridor ahead (|lateral| < half, 0.05 m < along < look, > 25 cm) that are NOT
   // walls of the taught map at the current pose = new obstacles (people, bikes, bins)
   uint8_t newPointsAhead(const uint16_t* scanCm, float half, float look) const;
+  // v4: distance (m) along the nose to the 2nd closest NEW point in that corridor (99 = none) and its
+  // lateral offset (m, + = left): where the new obstacle is, for the early detection and the detour
+  float newAhead(const uint16_t* scanCm, float half, float look, float* latM = nullptr) const;
   // pose in the web map frame (Route map card)
   void global(float& gx, float& gy, float& gth) const;
 

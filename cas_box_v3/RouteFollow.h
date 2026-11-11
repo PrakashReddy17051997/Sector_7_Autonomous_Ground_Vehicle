@@ -235,6 +235,55 @@ public:
   float lpEndAgreeFrac = 0.85f;         // start alignment: turn steps (<= 90 deg each) + LiDAR re-checks
   bool tacticActive() const { return active() && _pivoting && turnTactics; }   // -> fast turn ramp in MotorShaper
   const char* tacticMsg() const { return _tacMsg; }
+  // ---- v4 (11.11., tools/v4_test/obstacle_sim on the real route code) ------------------------------
+  // SMART OBSTACLES. v3 saw a NEW thing on the locked path only inside hardStopM (0.45 m) and then braked with the
+  // 2 s S-curve -> it rolled into it (sim: 3 of 3 boxes hit). Now:
+  //   - new things (not in the leg map) count from avoidPlanM (1.5 m) ahead; the stop for them is FIRM (firmStop()
+  //     -> MotorShaper 0.6 s); mapped walls keep the old rules (lpStopM / hardStopM / END_FRONT)
+  //   - standing, the obstacle is watched: it MOVES (person, bike: > avMoveM in staticMs) -> wait as before (avoid
+  //     after 3 s at the latest); it STANDS still for staticMs -> detour at once
+  //   - detour: the obstacle's width from the scan (neighbouring points < 0.3 m apart), side with the smaller
+  //     shift whose 45 deg diagonal and side ultrasonic are free (never right on noRight legs), OUT at 45 deg until
+  //     beside it + avClearM, PASS parallel until it is behind, then BACK to the line (path mode: the pursuit
+  //     takes the rover back; otherwise 45 deg back until the dead-reckoned offset is gone)
+  //   smartAvoid = false: the v3 handling (wait 3 s, sidestep to the closest free direction).
+  bool smartAvoid = true;
+  float avoidPlanM = 1.5f;        // new things closer than this in the corridor (2 x 0.35 m): obstacle
+  float avClearM = 0.45f;         // rover centre passes this far from the obstacle edge (half width 0.15 + 0.3)
+  float avMinClearM = 0.30f;      // ... at least this far when the diagonal runs out of room (wall beside)
+  float avMaxShiftM = 1.2f;       // never further off the line than this (open edges: noRight legs, raised path)
+  float avMaxWidthM = 1.5f;       // wider: a wall across -> no detour (wait / pause as before)
+  float avAngleDeg = 45.0f;       // OUT / BACK direction relative to the line
+  float avMoveM = 0.10f;          // obstacle moved more than this between scans while we stand: it is moving
+  uint32_t staticMs = 750;        // ... not moved for this long: static -> detour now
+  float avMinScore = 0.6f;        // early (1.5 m) detection only with a LiDAR match at least this good
+  bool firmStop() const { return active() && ((_state == AVOID && _avPhase < 10) || _state == BACKUP); }   // -> MotorShaper.firm
+  // SMOOTH REROUTE (v4b, 11.11.): a static thing seen EARLY (new points up to rrLookM ahead on the locked path,
+  // 2 scans) is passed on a planned smooth curve without stopping:
+  //   lateral offset y(s) along the line (dead-reckoned frame of the moment it was seen):
+  //     ramp out   y = y0 + (G - y0) * u^2 (3 - 2u),  u = (s - s0) / Lr      (smoothstep: no kink, no turn on the spot)
+  //     hold       y = G                                until the obstacle is 0.6 m behind and nothing is beside
+  //     ramp back  y = G * (1 - u^2 (3 - 2u))           back onto the line, then the normal leg rules
+  //   G = obstacle edge + avClearM (+ LiDAR bin) on the side with the smaller shift; the ramp is as long as the
+  //   rover's rolling turn rate needs: max curvature of the smoothstep = 6 |G| / Lr^2 <= w / v
+  //     -> Lr = sqrt(6 |G| v / w)    (|G| 0.7 m, v 0.20 m/s, w 6 deg/s -> 2.8 m)
+  //   The whole curve is checked against EVERY LiDAR point (rover 0.4 x 0.26 m swept along it, rrClearM from the
+  //   centre line), at the plan and again on every scan; blocked later -> firm stop and the 45 deg detour above.
+  //   The rover follows the curve by pure pursuit (rrLd ahead) at rrSpeed, wheel difference up to rrCorrMax.
+  //   Not enough room before the obstacle (seen too late) -> the stop + 45 deg detour above.
+  bool smoothReroute = true;
+  float rrLookM = 3.5f;           // look this far ahead for new things
+  float rrSpeed = 0.20f;          // speed on the curve (slower = tighter curve for the same turn rate)
+  float rrTurnDegS = 6.0f;        // the curve never needs more than this turn rate while rolling (rover: ~6-8 deg/s)
+  float rrMinRampM = 1.5f, rrMaxRampM = 4.0f;
+  float rrClearM = 0.30f;         // swept rover centre line >= this from every LiDAR point (body half width 0.13)
+  float rrCorrMax = 0.20f;        // wheel-difference limit on the curve (rolling hold: corrMax 0.10)
+  float rrLd = 0.8f;              // pure-pursuit look-ahead on the curve
+  float rrMaxWidthM = 0.8f;       // wider obstacles: the stop + 45 deg detour (sim: walls beside are handled better)
+  // a curve needs the obstacle >= 0.7 * ramp + 0.5 m ahead (the rover lags the curve); seen later: stop + 45 deg detour
+  bool rerouting() const { return _state == AVOID && _avPhase >= 10; }
+  uint8_t avoidPhase() const { return _state == AVOID ? _avPhase : 0; }   // 1-3 detour, 10-12 smooth reroute
+
   bool alignStart = true;
   float alignMaxOffM = 0.6f;          // rover put down within this of the taught start point
   float alignDeg() const { return _alignDeg; }       // how far the rover was turned off at the start
@@ -353,6 +402,32 @@ private:
   float _fr[4] = {9, 9, 9, 9}; uint8_t _frN = 0, _frI = 0;
   // obstacle handling
   uint8_t _avPhase = 0, _avTries = 0; float _avTarget = 0, _avEff = 0, _passEff = -99;
+  // v4 smart obstacle handling
+  bool _avMid = false;               // re-planning in the middle of a detour (keep line + offset)
+  float _avGoal = 0, _avGoalMin = 0;
+  int8_t _avDir = 1;                  // +1 left, -1 right
+  float _avBase = 0, _avShift = 0, _avAlong = 0, _avLat = 0, _avS = 0, _avEffPrev = 0;   // line yaw (deg); shift, obstacle along, offset (+ left), progress (m)
+  float _avObA = 99, _avObL = 0, _avBackS = 0;   // obstacle (front, centre m) at the last scan; progress at BACK start
+  uint32_t _avStillMs = 0;
+  bool _avPlan(const Sensors& s, const Leg& L, float& shift, int8_t& dir, float& along);
+  bool _avCluster(const Sensors& s, float& front, float& lo, float& hi) const;
+  // v4b smooth reroute
+  struct Curve { float s0, y0, g, l, sb, l2; };   // see SMOOTH REROUTE; sb < 0 = still holding
+  Curve _rc = {0, 0, 0, 1, -1, 1};
+  uint8_t _rrN = 0;
+  static float _curveY(const Curve& c, float sx);
+  bool _rrFree(const Sensors& s, const Curve& c, float rel, float sFrom, float sTo, float clear) const;
+  bool _rrTry(const Sensors& s, const Leg& L, float ry, float front, float latL, uint32_t now);
+  void _rerouteStep(const Sensors& s, const Leg& L, float ry, uint32_t now);
+  bool _besideLine(const Sensors& s) const;
+  float _lineYaw(const Leg& L, float ry) const;
+  bool _avPhase0Out() const;
+  int8_t _avBackDir = 0;
+  bool _rrEdges(const Sensors& s, float front, float latHintCw, float& lo, float& hi) const;
+  float _rrObY = 0;
+  void _avoidSmart(const Sensors& s, const Leg& L, float ry, uint32_t now);
+  float _newAhead(const Sensors& s, float look, float* lat);
+
   // stuck detection
   uint16_t _ref[Sensors::kLidarPoints];
   float _refYaw = 0; uint32_t _refMs = 0; bool _refMoving = false; uint8_t _stuckN = 0, _backups = 0;

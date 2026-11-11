@@ -314,7 +314,8 @@ void RouteFollow::_control(const Sensors& s) {
   }
 
   // ---- rolling: PD heading hold (Kethan)
-  const float limit = fminf(corrMax, corrFrac * fabsf(base));
+  // v4b: on the smooth reroute curve a bigger wheel difference (the curve is planned for it)
+  const float limit = rerouting() ? fminf(rrCorrMax, 0.8f * fabsf(base)) : fminf(corrMax, corrFrac * fabsf(base));
   const float want = _clamp((ae > 0.5f ? hKp * e : 0.0f) - hKd * _rate, -limit, limit);
   if (dt <= 0 || dt >= 0.1f) _hc = 0;
   else _hc += _clamp(want - _hc, -corrRate * dt, corrRate * dt);
@@ -403,6 +404,9 @@ void RouteFollow::_step(const Sensors& s, const WallFollow& wf) {
   _stepRy = ry;
   // ---- local path localisation: every step, in every state (turns and obstacles included)
   if (_lpOn) {
+    // v4: during a detour the rover is off the taught path on purpose - the scan match still works there (sim:
+    // score 0.85 at 0.8 m off), but the 1 m relocation rule snapped the pose back onto the path
+    _lp.relocOffM = (_state == AVOID && (_avPhase >= 1 || _avMid)) ? 1.8f : 1.0f;
     for (uint8_t k = 0; k < Sensors::kLidarPoints; k++) _scan[k] = s.lidarCm(k);
     const float dy = _wrap(s.yawDeg() - _lpYawPrev) * DEG_TO_RAD;
     _lpYawPrev = s.yawDeg();
@@ -521,6 +525,7 @@ void RouteFollow::_step(const Sensors& s, const WallFollow& wf) {
     }
 
     case AVOID: {
+      if (smartAvoid) { _avoidSmart(s, L, ry, now); return; }   // v4
       const float fr = _front(s);
       if (_avPhase == 0) {                     // wait: people / bikes pass by
         _l = _r = 0;
@@ -591,6 +596,14 @@ void RouteFollow::_step(const Sensors& s, const WallFollow& wf) {
       // teaching run had also seen - in the teaching run you turned before it). A leg that ends at a wall
       // ahead (END_FRONT) ends here.
       const bool ramp = onRamp();   // 06.11.: ramp leg AND on the slope now (was: the whole ramp leg)
+      // v4b: a new thing seen EARLY (up to rrLookM, 2 scans in a row) -> smooth reroute without stopping
+      if (smartAvoid && smoothReroute && !ramp && !_lmkOn && pathLocked() && _lp.score() >= avMinScore) {
+        float nl = 0;
+        for (uint8_t k = 0; k < Sensors::kLidarPoints; k++) _scan[k] = s.lidarCm(k);
+        const float fn = _lp.newAhead(_scan, 0.35f, rrLookM, &nl);
+        if (fn < rrLookM && fn > 1.2f) { if (_rrN < 255) _rrN++; } else _rrN = 0;
+        if (_rrN >= 2 && !(L.end == END_FRONT && _eff >= 0.3f * L.effort) && _rrTry(s, L, ry, fn, nl, now)) { _rrN = 0; return; }
+      }
       // path mode, locked: walls of the taught map only count closer than 0.25 m (you drove the
       // teaching run within 5-25 cm of things in places); NEW things (not in the map) at hardStopM
       // (narrow corridor 0.18 m = rover half width + 5 cm: the teaching run passed walls that close)
@@ -615,10 +628,19 @@ void RouteFollow::_step(const Sensors& s, const WallFollow& wf) {
       // things close up (< 25 cm). Not on the slope (it sees the ramp surface there).
       const int usf = s.usCm(0);
       if (!ramp && usf > 2 && usf < usStopCm) blocked = true;
+      // v4: a NEW thing (not in the leg map) on the locked path counts from avoidPlanM (1.5 m), not only inside
+      // hardStopM - with the 2 s S-curve stop the rover rolled ~0.3 m into it (obstacle_sim scenario 1)
+      // (only with a reliable match: with a weak one mapped walls land beside their cells and look new -
+      // replay of log_027: 11 false starts, 7 of them at score < 0.6 or at a leg start with people around)
+      float farNew = 99;
+      if (smartAvoid && !ramp && _lp.score() >= avMinScore) farNew = _newAhead(s, avoidPlanM, nullptr);
+      if (farNew < avoidPlanM) blocked = true;
       if (ramp) blocked = false;
       _lowN = blocked ? (uint8_t)(_lowN + 1) : 0;
-      if (_lowN >= 2) {                        // two scans in a row: a real obstacle
+      // two scans in a row: a real obstacle; three if it is only seen far ahead (> 0.9 m) - still >= 1.2 m left
+      if (_lowN >= (farNew < avoidPlanM && farNew > 0.9f && frStop >= hs && fr >= avoidEnterM ? 3 : 2)) {
         _state = AVOID; _avPhase = 0; _stateMs = now; _l = _r = 0; _lowN = 0;
+        _avStillMs = 0; _avObA = 99; _avObL = 0; _avMid = false;
         strlcpy(_msg, "obstacle - waiting", sizeof(_msg));
         return;
       }
@@ -1000,4 +1022,362 @@ void RouteFollow::_startTurnStep(const Sensors& s, float ry, uint32_t now) {
   _startTurn = false;
   _state = DRIVE; _stateMs = now;
   snprintf(_msg, sizeof(_msg), "leg %u: %s", (unsigned)(_i + 1), L.name);
+}
+
+// ---- v4: smart obstacle handling (see RouteFollow.h, "SMART OBSTACLES") --------------------------------------
+
+// New (not mapped) thing in the corridor ahead (2 x 0.35 m): distance (m) along the nose, 99 = none. Only on the
+// LOCKED path - without the cm-exact leg map a wall at a corner would look like an obstacle at 1.5 m (the v3 rules
+// at avoidEnterM / hardStopM stay in charge there).
+float RouteFollow::_newAhead(const Sensors& s, float look, float* lat) {
+  if (!pathLocked()) return 99.0f;
+  for (uint8_t k = 0; k < Sensors::kLidarPoints; k++) _scan[k] = s.lidarCm(k);
+  return _lp.newAhead(_scan, 0.35f, look, lat);
+}
+
+// The obstacle ahead: its edges from the scan (points at about its distance, neighbours < 0.3 m apart), the
+// side with the smaller shift whose 45 deg diagonal and side ultrasonic are free. false = no way round.
+bool RouteFollow::_avCluster(const Sensors& s, float& front, float& lo, float& hi) const {
+  front = _corridor(s, 0, 0.35f, 3.0f);
+  if (front >= 3.0f) return false;
+  float lat[Sensors::kLidarPoints];
+  uint8_t n = 0;
+  for (uint8_t k = 0; k < Sensors::kLidarPoints; k++) {
+    const uint16_t cm = s.lidarCm(k);
+    if (cm < 25) continue;
+    const float a = (k * 4.0f + 2.0f) * DEG_TO_RAD, rr = cm / 100.0f, al = rr * cosf(a), lt = rr * sinf(a);   // lt + = right
+    if (al >= front - 0.15f && al <= front + 0.6f && fabsf(lt) < 2.0f) lat[n++] = lt;
+  }
+  if (!n) return false;
+  for (uint8_t x = 1; x < n; x++) for (uint8_t q = x; q > 0 && lat[q - 1] > lat[q]; q--) { const float t = lat[q]; lat[q] = lat[q - 1]; lat[q - 1] = t; }
+  int seed = -1;
+  for (uint8_t k = 0; k < n; k++) if (fabsf(lat[k]) < 0.35f && (seed < 0 || fabsf(lat[k]) < fabsf(lat[seed]))) seed = k;
+  if (seed < 0) return false;
+  int a = seed, b = seed;
+  while (a > 0 && lat[a] - lat[a - 1] < 0.3f) a--;
+  while (b < n - 1 && lat[b + 1] - lat[b] < 0.3f) b++;
+  lo = lat[a]; hi = lat[b];                                     // left edge (most negative), right edge
+  return true;
+}
+
+bool RouteFollow::_avPlan(const Sensors& s, const Leg& L, float& shift, int8_t& dir, float& along) {
+  float front, lo, hi;
+  if (!_avCluster(s, front, lo, hi)) return false;
+  if (hi - lo > avMaxWidthM) { strlcpy(_msg, "obstacle too wide - waiting", sizeof(_msg)); return false; }
+  // a 4 deg LiDAR bin hides up to front * sin(4 deg) of the edge: add it
+  const float binM = front * 0.07f;
+  const float sL = fmaxf(-lo + avClearM + binM, 0.25f), sR = fmaxf(hi + avClearM + binM, 0.25f);
+  const float sn = sinf(avAngleDeg * DEG_TO_RAD);
+  auto ok = [&](float sh, int8_t d) {
+    if (sh > avMaxShiftM || (d < 0 && L.noRight)) return false;
+    const int u = s.usCm(d > 0 ? 1 : 2);                          // side ultrasonic: nothing right beside the rover
+    if (u > 2 && u < 50) return false;
+    const float need = sh / sn + 0.2f;                           // the diagonal up to the shift + half the rover
+    return _corridor(s, -d * avAngleDeg, 0.25f, need) >= need - 0.01f;   // rover half width 0.13 + 0.12; + = right
+  };
+  const bool okL = ok(sL, 1), okR = ok(sR, -1);
+  if (!okL && !okR) { strlcpy(_msg, "obstacle - no free side, waiting", sizeof(_msg)); return false; }
+  dir = (okL && (!okR || sL <= sR)) ? 1 : -1;
+  shift = dir > 0 ? sL : sR;
+  along = front;
+  Serial.printf("[route] obstacle %.2f m ahead, %.2f m wide (%.2f..%.2f) -> detour %s, shift %.2f m\n", front, hi - lo, lo, hi,
+                dir > 0 ? "left" : "right", shift);
+  return true;
+}
+
+// AVOID with smartAvoid: 0 stand + watch, 1 OUT (45 deg), 2 PASS (parallel), 3 BACK (45 deg back to the line)
+void RouteFollow::_avoidSmart(const Sensors& s, const Leg& L, float ry, uint32_t now) {
+  for (uint8_t i = 0; i < Sensors::kLidarPoints; i++) _scan[i] = s.lidarCm(i);
+  if (_avPhase >= 1) {                                           // dead-reckoned offset from the line (m, + = left)
+    const float de = (_eff - _avEffPrev) * lmkMPerEff, rel = _wrap(ry - _avBase) * DEG_TO_RAD;
+    _avEffPrev = _eff;
+    _avLat += de * sinf(rel);
+    _avS += de * cosf(rel);
+    if (now - _stateMs > 60000) { pause("detour took > 60 s - help me, Resume"); return; }
+  }
+  // never turn on the spot with something closer than 0.22 m to the centre (the body corners sweep ~0.2 m)
+  if (_pivoting && _avPhase >= 1) {
+    uint16_t mn = 999;
+    for (uint8_t k = 0; k < Sensors::kLidarPoints; k++) { const uint16_t c = s.lidarCm(k); if (c >= 15 && c < mn) mn = c; }
+    if (mn < 22) { pause("too close to turn - move me, Resume"); return; }
+  }
+  const float fr = _front(s);
+  const bool fwdOk = _corridor(s, 0, 0.20f, 1.0f) > 0.45f;    // detour: the rover-wide corridor decides
+  if (_avPhase >= 10) { _rerouteStep(s, L, ry, now); return; }   // v4b smooth reroute
+  if (_avPhase == 0) {
+    _l = _r = 0;
+    // free again? nothing new within avoidPlanM on the locked path / corridor free otherwise
+    float lat = 0;
+    const float nd = pathLocked() ? _lp.newAhead(_scan, 0.35f, avoidPlanM + 0.5f, &lat) : _corridor(s, 0, 0.35f, avoidPlanM + 0.5f);
+    const bool free = pathLocked() ? (nd >= avoidPlanM && _corridor(s, 0, 0.18f, 1.5f) > lpStopM + 0.05f) : fr > avoidFreeM - 0.2f;
+    // re-planning in the middle of a detour: pass only once really beside it (the minimum lateral goal reached)
+    if (free && _avMid && _avDir * (_avLat - _avGoalMin) >= 0) {
+      if (_corridor(s, -_wrap(_avBase - ry), 0.20f, 1.0f) >= 0.60f) {   // the way parallel to the line is free
+        _avMid = false; _avPhase = 2; _avEffPrev = _eff; strlcpy(_msg, "obstacle - passing", sizeof(_msg)); return;
+      }
+      const float g = _avLat + _avDir * 0.20f;                   // the corner is still in the way: 0.2 m further out
+      if (fabsf(g) <= avMaxShiftM) {
+        _avGoal = _avGoalMin = g; _avMid = false; _avPhase = 1; _avEffPrev = _eff;
+        strlcpy(_msg, "obstacle - a bit further out", sizeof(_msg)); return;
+      }
+    }
+    if (_avMid && _avTries >= 7) { pause("detour blocked - help me, then Resume"); return; }
+    if (free && _avMid && _avPhase0Out()) {                       // not beside it yet: carry on OUT to the planned offset
+      _avPhase = 1; _avEffPrev = _eff; _avMid = false; strlcpy(_msg, "obstacle - detour (going on)", sizeof(_msg)); return;
+    }
+    if (free) { _avMid = false; _state = DRIVE; strlcpy(_msg, "way free again", sizeof(_msg)); return; }
+    // moving or standing? (judged only when the rover itself stands)
+    // the obstacle = its cluster (front distance + centre of its edges): a flat face jitters point by point
+    float cf = 99, clo = 0, chi = 0;
+    const bool cl = _avCluster(s, cf, clo, chi);
+    const float cc = cl ? 0.5f * (clo + chi) : 0.0f;
+    if (fabsf(_outV) > 0.03f || !cl) { _avObA = cl ? cf : 99; _avObL = cc; _avStillMs = 0; return; }
+    const bool moved = _avObA < 90 && (fabsf(cf - _avObA) > avMoveM || fabsf(cc - _avObL) > avMoveM);
+    _avObA = cf; _avObL = cc;
+    if (moved) { _avStillMs = 0; strlcpy(_msg, "obstacle moving - waiting", sizeof(_msg)); }
+    else if (!_avStillMs) _avStillMs = now;
+    const bool still = _avStillMs && now - _avStillMs >= staticMs;
+    if (!still && now - _stateMs < 3000) return;                // people pass by: wait (max 3 s)
+    float shift, along; int8_t dir;
+    if (!_avPlan(s, L, shift, dir, along)) {
+      if (now - _stateMs < 3000) return;
+      if (++_avTries >= 3) { pause("blocked - help me, then Resume"); return; }
+      _stateMs = now;                                            // wait another 3 s, then plan again
+      return;
+    }
+    if (!_avMid) { _avBase = ry; _avLat = 0; _avS = 0; }       // a fresh detour (standing, facing it): the line is here
+    _avMid = false;
+    _avDir = dir; _avShift = shift;
+    _avGoal = _clamp(_avLat + dir * shift, -avMaxShiftM, avMaxShiftM);   // lateral goal of OUT (m, + = left)
+    _avGoalMin = _avLat + dir * fmaxf(shift - (avClearM - avMinClearM), 0.2f);   // enough if the diagonal runs out
+    _avAlong = _avS + along;                                     // where the obstacle is, along the line
+    _avEffPrev = _eff;
+    _avPhase = 1; _avTries++; _stateMs = now;
+    snprintf(_msg, sizeof(_msg), "obstacle - detour %s (%.0f cm)", dir > 0 ? "left" : "right", shift * 100.0f);
+    return;
+  }
+  // something in the way of the detour (rover-wide corridor): already beside the obstacle with the minimum
+  // clearance -> pass it now; else stand and re-plan, keeping the line and the offset
+  // (the rover-wide corridor ahead along the PASS direction = the line: that is where it goes next)
+  if (_corridor(s, 0, 0.20f, 1.0f) < 0.40f && !_pivoting && _avPhase == 1 && _avDir * (_avLat - _avGoalMin) >= 0 &&
+      _corridor(s, -_wrap(_avBase - ry), 0.20f, 1.0f) >= 0.60f) {
+    _avPhase = 2; strlcpy(_msg, "obstacle - passing (tight)", sizeof(_msg));
+  }
+  if (_corridor(s, 0, 0.20f, 1.0f) < 0.40f && !_pivoting && !(_avPhase == 2 && fabsf(_wrap(_avBase - ry)) > turnDoneDeg)) {
+    _avPhase = 0; _avMid = true; _stateMs = now; _avStillMs = 0; _avObA = 99; _l = _r = 0; _avTries++;
+    strlcpy(_msg, "detour blocked - re-planning", sizeof(_msg));
+    return;
+  }
+  if (_avPhase == 1) {                                           // OUT: until beside the obstacle + clearance
+    if (_avDir * (_avLat - _avGoal) >= 0) { _avPhase = 2; strlcpy(_msg, "obstacle - passing", sizeof(_msg)); }
+    else if (_avS > _avAlong + 0.3f) { _avPhase = 0; _avMid = true; _stateMs = now; _avStillMs = 0; _avObA = 99; _l = _r = 0; return; }   // past it without the shift: re-check
+    _drive(_wrap(_avBase + _avDir * avAngleDeg - ry), _speed, fwdOk);
+    return;
+  }
+  if (_avPhase == 2) {                                           // PASS: parallel until it is behind
+    const bool beside = _besideLine(s);                          // something between the rover and the line?
+    if (_avS >= _avAlong + 0.6f && !beside) { _avPhase = 3; _avBackS = _avS; _avBackDir = 0; strlcpy(_msg, "obstacle passed - back to the line", sizeof(_msg)); }
+    _drive(_wrap(_avBase - ry), _speed, true);
+    return;
+  }
+  // BACK: 45 deg towards the line until the offset is gone (locked: the localiser's cross-track, else dead
+  // reckoning), then the normal leg rules (pursuit / wall / heading)
+  // the side to go back to is fixed when BACK starts (no flip-flopping when dead reckoning and the localiser disagree)
+  if (_avBackDir == 0) _avBackDir = (pathLocked() ? _lp.crossTrack() : _avLat) > 0 ? -1 : 1;
+  const int8_t back = _avBackDir;
+  const bool onLine = (pathLocked() && fabsf(_lp.crossTrack()) < 0.15f) ||
+                      (pathLocked() && back * _lp.crossTrack() > 0.0f) ||   // localiser: crossed the path
+                      (!pathLocked() && -back * _avLat <= 0.10f);
+  if (onLine || _avS - _avBackS > 2.0f * _avShift + 1.0f) {
+    _peInit = false;
+    _state = DRIVE; _passEff = _eff;
+    strlcpy(_msg, "obstacle passed", sizeof(_msg));
+    Serial.printf("[route] detour done (%.1f m along, %.2f m off)\n", _avS, _avLat);
+    return;
+  }
+  _drive(_wrap(_avBase + back * avAngleDeg - ry), _speed, fwdOk);
+}
+
+// ---- v4b: smooth reroute (see RouteFollow.h, "SMOOTH REROUTE") -------------------------------------------------
+#ifdef RR_DEBUG
+#define RRDBG(w) Serial.printf("[rr] %s front %.2f\n", w, front)
+#else
+#define RRDBG(w)
+#endif
+
+// something beside the rover between it and the line (the obstacle not yet passed)?
+bool RouteFollow::_besideLine(const Sensors& s) const {
+  for (uint8_t k = 0; k < Sensors::kLidarPoints; k++) {
+    const uint16_t cm = s.lidarCm(k);
+    if (cm < 25) continue;
+    const float a = (k * 4.0f + 2.0f) * DEG_TO_RAD, rr = cm / 100.0f, al = rr * cosf(a), lt = rr * sinf(a);
+    const float toLine = _avLat > 0 ? lt : -lt;                  // the line is right of the rover when it is left of it
+    if (al > -0.4f && al < 0.5f && toLine > 0.1f && toLine < fabsf(_avLat) + 0.3f) return true;
+  }
+  return false;
+}
+
+// Edges of the obstacle about front m ahead whose centre is near latHintCw (+ = right): points at its distance,
+// neighbours < 0.3 m apart. lo = left edge, hi = right edge (cw lateral, m).
+bool RouteFollow::_rrEdges(const Sensors& s, float front, float latHintCw, float& lo, float& hi) const {
+  float lat[Sensors::kLidarPoints];
+  uint8_t n = 0;
+  for (uint8_t k = 0; k < Sensors::kLidarPoints; k++) {
+    const uint16_t cm = s.lidarCm(k);
+    if (cm < 25) continue;
+    const float a = (k * 4.0f + 2.0f) * DEG_TO_RAD, rr = cm / 100.0f, al = rr * cosf(a), lt = rr * sinf(a);   // lt + = right
+    if (al >= front - 0.15f && al <= front + 0.6f && fabsf(lt) < 2.5f) lat[n++] = lt;
+  }
+  if (!n) return false;
+  for (uint8_t x = 1; x < n; x++) for (uint8_t q = x; q > 0 && lat[q - 1] > lat[q]; q--) { const float t = lat[q]; lat[q] = lat[q - 1]; lat[q - 1] = t; }
+  int seed = -1;
+  for (uint8_t k = 0; k < n; k++) if (fabsf(lat[k] - latHintCw) < 0.35f && (seed < 0 || fabsf(lat[k] - latHintCw) < fabsf(lat[seed] - latHintCw))) seed = k;
+  if (seed < 0) return false;
+  int a = seed, b = seed;
+  while (a > 0 && lat[a] - lat[a - 1] < 0.3f) a--;
+  while (b < n - 1 && lat[b + 1] - lat[b] < 0.3f) b++;
+  lo = lat[a]; hi = lat[b];
+  return true;
+}
+
+float RouteFollow::_curveY(const Curve& c, float sx) {
+  if (sx <= c.s0) return c.y0;
+  if (sx < c.s0 + c.l) { const float u = (sx - c.s0) / c.l; return c.y0 + (c.g - c.y0) * u * u * (3.0f - 2.0f * u); }
+  if (c.sb < 0 || sx <= c.sb) return c.g;
+  if (sx < c.sb + c.l2) { const float u = (sx - c.sb) / c.l2; return c.g * (1.0f - u * u * (3.0f - 2.0f * u)); }
+  return 0.0f;
+}
+
+// Is the curve between sFrom and sTo free? Every LiDAR point (into the line frame: rover at _avS / _avLat, heading
+// rel off the line) against the rover body (0.4 m long) swept along the curve: lateral distance >= clear.
+bool RouteFollow::_rrFree(const Sensors& s, const Curve& c, float rel, float sFrom, float sTo, float clear) const {
+  const float cr = cosf(rel), sr = sinf(rel);
+  for (uint8_t k = 0; k < Sensors::kLidarPoints; k++) {
+    const uint16_t cm = s.lidarCm(k);
+    if (cm < 25) continue;
+    const float a = (k * 4.0f + 2.0f) * DEG_TO_RAD, rr = cm / 100.0f, al = rr * cosf(a), ll = -rr * sinf(a);   // ll + = left
+    const float px = _avS + al * cr - ll * sr, py = _avLat + al * sr + ll * cr;
+    if (px < sFrom - 0.2f || px > sTo + 0.2f) continue;
+    for (int j = -1; j <= 1; j++) {
+      const float sc = px + 0.2f * j;
+      if (sc < sFrom || sc > sTo) continue;
+      if (fabsf(py - _curveY(c, sc)) < clear) return false;
+    }
+  }
+  return true;
+}
+
+// Plan a smooth reroute around the new thing front m ahead (lateral latL, + = left). Starts a fresh line frame
+// when no detour is running. true = AVOID phase 10.
+bool RouteFollow::_rrTry(const Sensors& s, const Leg& L, float ry, float front, float latL, uint32_t now) {
+  const bool fresh = _state != AVOID;
+  const float base = fresh ? _lineYaw(L, ry) : _avBase, sNow = fresh ? 0.0f : _avS;
+  const float yNow = fresh ? (pathLocked() ? _lp.crossTrack() : 0.0f) : _avLat;
+  const float rel = _wrap(ry - base) * DEG_TO_RAD;
+  float lo, hi;
+  if (!_rrEdges(s, front, -latL, lo, hi)) { RRDBG("no seed"); return false; }
+  if (hi - lo > rrMaxWidthM) { RRDBG("too wide"); return false; }   // wide things: stop + 45 deg detour (handles walls beside better)
+  const float bin = fmaxf(front * 0.035f, 0.08f), v = fminf(_speed, rrSpeed), w = rrTurnDegS * DEG_TO_RAD;   // edge margin: half a 4 deg bin, >= 8 cm
+  Curve best = {0, 0, 0, 1, -1, 1};
+  float bestCost = 1e9f;
+  for (int8_t d = 1; d >= -1; d -= 2) {
+    if (d < 0 && L.noRight) continue;
+    const float g = d > 0 ? yNow - lo + avClearM + bin : yNow - hi - avClearM - bin;   // lateral goal (+ = left)
+    if (fabsf(g) > avMaxShiftM) { RRDBG("shift"); continue; }
+    const int u = s.usCm(d > 0 ? 1 : 2);
+    if (u > 2 && u < 50) { RRDBG("us"); continue; }
+    const float lr = _clamp(sqrtf(6.0f * fabsf(g - yNow) * v / w), rrMinRampM, rrMaxRampM);
+    if (front < 0.7f * lr + 0.5f) { RRDBG("room"); continue; }   // seen too late for a curve the rover can follow
+    const Curve c = {sNow, yNow, g, lr, -1, lr};
+    if (!_rrFree(s, c, rel, sNow, sNow + front + 1.0f, rrClearM)) { RRDBG("not free"); continue; }
+    const float cost = fabsf(g - yNow);
+    if (cost < bestCost) { bestCost = cost; best = c; }
+  }
+  if (bestCost > 1e8f) return false;
+  if (fresh) { _avBase = base; _avS = 0; _avLat = yNow; _avTries = 0; }
+  _avEffPrev = _eff;
+  _rc = best;
+  _avAlong = sNow + front;
+  _avDir = best.g > yNow ? 1 : -1;
+  _avShift = fabsf(best.g - yNow);
+  _avGoal = best.g; _avGoalMin = best.g - _avDir * (avClearM - avMinClearM);   // if it hands over to the 45 deg rules
+  _rrObY = yNow - 0.5f * (lo + hi);                              // obstacle centre, line frame (+ = left)
+  _avMid = false;
+  _state = AVOID; _avPhase = 10; _stateMs = now;
+  snprintf(_msg, sizeof(_msg), "reroute %s (%.1f m ahead, %.0f cm)", _avDir > 0 ? "left" : "right", front, fabsf(best.g - yNow) * 100.0f);
+  Serial.printf("[route] smooth reroute: obstacle %.2f m ahead, %.2f m wide -> %s to %.2f m, ramp %.1f m\n", front, hi - lo,
+                _avDir > 0 ? "left" : "right", best.g, best.l);
+  return true;
+}
+
+// 10 ramp out, 11 hold, 12 ramp back - pure pursuit on the planned curve, re-checked on every scan
+void RouteFollow::_rerouteStep(const Sensors& s, const Leg& L, float ry, uint32_t now) {
+  (void)L;
+  const float rel = _wrap(ry - _avBase) * DEG_TO_RAD;
+  const float v = fminf(_speed, rrSpeed), w = rrTurnDegS * DEG_TO_RAD;
+  // closer = sharper picture (at 3 m a 40 cm box is 1-2 LiDAR points): re-measure the edges on every scan of the
+  // ramp-out and move the curve further out if needed (only outwards; too far -> stop, the 45 deg rules decide)
+  const float ahead = _avAlong - _avS;
+  if ((_avPhase == 10 || _avPhase == 11) && ahead > 0.3f) {
+    float lo, hi;
+    if (_rrEdges(s, ahead, -(_rrObY - _avLat), lo, hi) && hi - lo <= avMaxWidthM) {
+      const float bin = fmaxf(ahead * 0.035f, 0.08f);
+      const float need = _avDir > 0 ? _avLat - lo + avClearM + bin : _avLat - hi - avClearM - bin;
+      if (_avDir * (need - _rc.g) > 0.03f) {
+        if (fabsf(need) > avMaxShiftM) {
+          _avPhase = 0; _avMid = true; _stateMs = now; _avStillMs = 0; _avObA = 99; _l = _r = 0;
+          strlcpy(_msg, "obstacle wider - stopping", sizeof(_msg));
+          return;
+        }
+        const float lr = _clamp(sqrtf(6.0f * fabsf(need - _avLat) * v / w), rrMinRampM * 0.6f, rrMaxRampM);
+        _rc = {_avS, _avLat, need, lr, -1, _rc.l2};
+        _avGoal = need; _avGoalMin = need - _avDir * (avClearM - avMinClearM);
+        _avPhase = 10;
+        _rrObY = _avLat - 0.5f * (lo + hi);
+      }
+    }
+  }
+  if (_avPhase == 10 && _avS >= _rc.s0 + _rc.l) _avPhase = 11;
+  if (_avPhase == 11 && _avS >= _avAlong + 0.6f && !_besideLine(s)) {   // passed: plan the way back
+    Curve c = _rc;
+    c.sb = _avS;
+    c.l2 = _clamp(sqrtf(6.0f * fabsf(_rc.g) * v / w), rrMinRampM, rrMaxRampM);
+    if (_rrFree(s, c, rel, _avS, c.sb + c.l2, rrClearM)) {
+      _rc = c; _avPhase = 12;
+      strlcpy(_msg, "obstacle passed - curving back", sizeof(_msg));
+    } else if (_avS > _avAlong + 4.0f) {                         // no way back for 4 m: stop, the 45 deg rules decide
+      _avPhase = 0; _avMid = true; _stateMs = now; _avStillMs = 0; _avObA = 99; _l = _r = 0;
+      strlcpy(_msg, "no way back - stopping", sizeof(_msg));
+      return;
+    }
+  }
+  if (_avPhase == 12 && _avS >= _rc.sb + _rc.l2) {
+    _state = DRIVE; _passEff = _eff; _peInit = false;
+    strlcpy(_msg, "obstacle passed", sizeof(_msg));
+    Serial.printf("[route] smooth reroute done (%.1f m along, %.2f m off)\n", _avS, _avLat);
+    return;
+  }
+  // what lies ahead on the curve still free? (something new, or the obstacle bigger than it looked)
+  const float sEnd = _avPhase == 12 ? _rc.sb + _rc.l2 : fmaxf(_avAlong + 0.8f, _rc.s0 + _rc.l);
+  if (!_rrFree(s, _rc, rel, _avS, sEnd, rrClearM - 0.05f) || _corridor(s, 0, 0.18f, 1.0f) < 0.35f) {
+    _avPhase = 0; _avMid = true; _stateMs = now; _avStillMs = 0; _avObA = 99; _l = _r = 0;   // firm stop, re-plan
+    strlcpy(_msg, "reroute blocked - stopping", sizeof(_msg));
+    Serial.println("[route] smooth reroute blocked -> stop, 45 deg detour rules");
+    return;
+  }
+  // pure pursuit on the curve
+  const float st = _avS + rrLd, yt = _curveY(_rc, st);
+  const float want = _avBase + atan2f(yt - _avLat, rrLd) * RAD_TO_DEG;
+  _drive(_wrap(want - ry), v, true);
+}
+
+// direction of the line a detour returns to: the taught path ahead when locked, else the leg heading
+float RouteFollow::_lineYaw(const Leg& L, float ry) const {
+  if (pathLocked()) return _wrap(ry + _lp.headingErrorToWaypoint(1.5f) * RAD_TO_DEG);
+  return L.ref;
+}
+
+// a detour was under way (offset taken, obstacle not yet passed) -> continue it rather than drive back over it
+bool RouteFollow::_avPhase0Out() const {
+  return _avDir != 0 && fabsf(_avLat) > 0.15f && _avS < _avAlong + 0.3f;
 }
