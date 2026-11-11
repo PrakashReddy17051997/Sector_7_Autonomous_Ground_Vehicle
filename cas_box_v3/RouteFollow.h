@@ -218,6 +218,16 @@ public:
   bool trimLearn = true;
   float trimTauS = 15.0f, trimTauFastS = 6.0f, trimMax = 0.60f, trimLearnBelowDeg = 6.0f;
   float driveSeconds() const { return _driveS; }
+  // TURN TACTICS (v3, 11.11. after log_030 - see RouteFollow.cpp): pivot full power, swing, shift, arc in a cycle
+  bool turnTactics = true;            // false = the old soft pivot 0.35 -> 0.50 + swing
+  float turnCmd = 0.50f;              // wheel command of pivot / swing / arc (outer wheels)
+  uint32_t turnTacticTimeoutMs = 60000;   // a turn may take this long before it gives up (start: PAUSE)
+  float backShiftMaxM = 0.6f;         // backward shifts in total per turn (no drop sensor behind the rover)
+  float fwdMoveMaxM = 1.5f;           // forward rolling (swing / shift / arc) in total per turn on the route
+  float fwdMoveStartM = 0.6f;         // ... in the start turn (raised path at M1, edge not visible to the LiDAR)
+  uint8_t startMaxRounds = 4;         // start alignment: turn steps (<= 90 deg each) + LiDAR re-checks
+  bool tacticActive() const { return active() && _pivoting && turnTactics; }   // -> fast turn ramp in MotorShaper
+  const char* tacticMsg() const { return _tacMsg; }
   bool alignStart = true;
   float alignMaxOffM = 0.6f;          // rover put down within this of the taught start point
   float alignDeg() const { return _alignDeg; }       // how far the rover was turned off at the start
@@ -346,7 +356,22 @@ private:
   char _endInfo[72] = "";
   // v3
   float _alignDeg = 0, _alignSc = 0, _alignSec = 0;
-  float _driveS = 0;                  // rolling time since boot (trim learning: fast for the first 40 s)
+  float _driveS = 0;
+  // v3 turn tactics + start turn
+  enum Tac : uint8_t { TK_NONE = 0, TK_PIVOT = 1, TK_SWING = 2, TK_SHIFT = 3, TK_ARC = 4, TK_REST = 5 };
+  uint8_t _tk = TK_NONE, _tkNext = 0, _tkCycles = 0, _floorH = 0;
+  uint32_t _tkMs = 0, _tkWinMs = 0, _settleMs = 0;
+  float _tkYaw = 0, _shiftM = 0, _backShiftM = 0, _fwdM = 0, _stepTgt = NAN;
+  uint32_t _floorMs = 0;
+  float _settleYaw = 0;
+  bool _shiftBack = false, _floorOk = false, _startTurn = false;
+  uint8_t _startRounds = 0;
+  char _tacMsg[32] = "";
+  bool _floorAhead(const Sensors& s);
+  bool _rearFree(const Sensors& s) const;
+  void _tacStart(uint8_t t, const Sensors& s, uint32_t now, bool first);
+  void _tactic(const Sensors& s, float dt, uint32_t now);
+  void _startTurnStep(const Sensors& s, float ry, uint32_t now);                  // rolling time since boot (trim learning: fast for the first 40 s)
   LandmarkLeg _lmk;
   bool _lmkOn = false;
   const char* _lmkWhy = "";

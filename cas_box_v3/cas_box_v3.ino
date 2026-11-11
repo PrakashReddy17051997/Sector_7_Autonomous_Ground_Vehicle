@@ -227,6 +227,9 @@ void loop() {
   shaper.setBattery(rover.voltage());   // battery compensation (MotorShaper: full pack -> smaller cmds)
   shaper.setPitch(sensors.pitchDeg());  // slope: less forward output downhill, a bit more uphill
   shaper.boost = mission.active() ? mission.route.boost() : 0.0f;   // no progress on rough ground: more
+  // v3 (log_030): turn tactics need full turn power quickly (Arjun: pivots worked 36 % with full power at once,
+  // 13 % with a slow ramp) - 0 -> 0.50 in 0.25 s while a tactic turn runs; the stop ramp stays gentle (wDown)
+  shaper.wUp = mission.active() && mission.route.tacticActive() ? 2.0f : 0.35f;
   shaper.apply(l, r, safetyReason != SafetyGuard::OK);   // gradual; a guard stop (obstacle / tilt) drops the speed at once
 
   rover.setDrive(l, r);                 // every loop pass, after guard and shaper
@@ -286,6 +289,8 @@ void loop() {
                   String(mission.route.crossTrack() * 100.0f, 0) + " cm (+ = left), I " + String(mission.route.xteI(), 1) +
                   " deg" + (mission.route.onRamp() ? ", ON RAMP" : ""));
     // v3
+    hmi.showValue("route.turn", String(mission.route.tacticActive() ? mission.route.tacticMsg() : "-") +
+                  ", floor US " + String(sensors.usCm(4)) + " cm, back US " + String(sensors.usCm(3)) + " cm");
     hmi.showValue("route.trim", String(mission.route.trim, 3) + " (start " + String(ROVER_TRIM_START, 2) + ", " +
                   String(mission.route.driveSeconds(), 0) + " s rolled)");
     hmi.showValue("radio", radio.statusText());
