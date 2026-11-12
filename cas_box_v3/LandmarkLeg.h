@@ -70,6 +70,11 @@ public:
     const char* why = "";
   };
 
+  // 12.11. (log_033, box 7): the side lines were REJECTED as "not parallel" on legs 6-7 (0 of 272 scans used):
+  // box 7's LiDAR sits ~7-9 deg differently from box 4 (whose scans made the tables, lineOff), and the gyro wanders
+  // a few degrees -> 10 + 7 + drift > paraDeg. Side lines get this much more tolerance; once one is used, its
+  // heading anchor (anchorGain) pulls the route yaw onto it and the error shrinks. Walls ahead / behind: unchanged.
+  float sideParaExtraDeg = 0;
   void begin(const LmkPhase* ph, uint8_t n) { _ph = ph; _n = n; _p = 0; _resetPhase(); _done = false; _sStop = -1; }
   bool active() const { return _ph && _n; }
   uint8_t phase() const { return _p; }
@@ -81,8 +86,11 @@ public:
   const char* typeName() const;
 
   // one LiDAR snapshot (4 Hz): scan (cm), route yaw now, leg course ref, distance s (m), dt (s),
-  // tilted = on a slope (the flat LiDAR plane hits the ground / sky): no line is trusted, hold
-  Out step(const uint16_t* scanCm, float ry, float ref, float s, float dt, bool tilted = false);
+  // tilted = PITCH off the start level (ramp up / down): the flat LiDAR plane hits the ground / sky AHEAD and
+  //          BEHIND -> ANCHOR / STOP (lines ahead / behind) hold. SIDE walls stay fine (12.11., M51-M57: the ramp
+  //          walls run along the slope, the tilted plane still cuts them at the same distance) -> still followed.
+  // rolled = ROLL off the start level (side slope): the plane hits the ground at the side -> side lines hold too.
+  Out step(const uint16_t* scanCm, float ry, float ref, float s, float dt, bool tilted = false, bool rolled = false);
 
 private:
   static float _clamp(float v, float lo, float hi) { return v < lo ? lo : (v > hi ? hi : v); }

@@ -222,6 +222,17 @@ public:
   bool turnTactics = true;            // false = the old soft pivot 0.35 -> 0.50 + swing
   float turnCmd = 0.50f;              // wheel command of swing / arc, and of the pivot when 0.35 does not turn it
   float kethanCmd = 0.35f;            // pivot first at Kethan's 0.35 (ramped 0 -> 0.35 in 1 s)
+  // ROLLING START (12.11., logs 030-033 of rover 7): a pivot started FROM STANDSTILL turned >= 10 deg in 2 s in 8 of
+  // 117 cases (7 %), started WHILE ROLLING in 21 of 41 (51 %) - e.g. log_033 738.9 s: rolling back at 0.3, pad pivot
+  // -> 20 deg in 1 s. So every turn on the spot starts by rolling straight (back if the rear is free, else forward)
+  // and goes into the 0.5 pivot WITHOUT stopping (MotorShaper: the speed fades over 2 s while the turn rises in 1 s).
+  // Stalls -> roll again (alternating back / forward, the rover stays within the back / forward limits).
+  bool rollStart = true;
+  float rollCmd = 0.30f;              // rolling speed before the pivot
+  float rollMaxM = 0.30f;             // roll at most this far per try (it pivots as soon as it moves at rollGoV)
+  float rollGoV = 0.20f;              // ... or once the real wheel speed reaches this
+  uint16_t rollCarryMs = 1200;        // the pivot keeps the rolling speed in its command, fading to 0 over this
+  float _rollV = 0;                   // signed rolling speed carried into the pivot (0 = pivot from rest)
   float climbPow = 0.40f;             // stuck: push straight at this first (no steering), climbMs long
   uint32_t climbMs = 3000;            // (the 2 s S-curve speed ramp needs ~2 s to reach climbPow)
   uint32_t turnTacticTimeoutMs = 60000;   // a turn may take this long before it gives up (start: PAUSE)
@@ -284,6 +295,7 @@ public:
   bool rerouting() const { return _state == AVOID && _avPhase >= 10; }
   uint8_t avoidPhase() const { return _state == AVOID ? _avPhase : 0; }   // 1-3 detour, 10-12 smooth reroute
 
+  float _roll0 = 0;                   // (12.11.) roll at the leg start: side lines are checked against the ROLL
   bool alignStart = true;
   float alignMaxOffM = 0.6f;          // rover put down within this of the taught start point
   float alignDeg() const { return _alignDeg; }       // how far the rover was turned off at the start
@@ -295,7 +307,9 @@ public:
   // position is the localizer's s scaled to it (effort can be 40 % off: log_031), else effort metres
   bool setLandmarkLeg(uint8_t legIdx, const LmkPhase* ph, uint8_t n, float lenM = 0);
   float lmkMPerEff = 1.03f;
-  float lmkTiltDeg = 3.5f;            // pitch off the start level by more: lines not trusted (ramp)
+  float lmkTiltDeg = 3.5f;            // pitch off the start level by more: lines AHEAD / BEHIND not trusted (ramp)
+  float lmkParaExtraDeg = 10.0f;      // 12.11.: side lines accepted this much less parallel (LandmarkLeg)
+  float lmkRollDeg = 5.0f;            // 12.11.: roll off the start level by more: SIDE lines not trusted either
   bool onLmkLeg() const { return active() && _lmkOn; }
   const LandmarkLeg& lmk() const { return _lmk; }
   float legMetres() const { return _eff * lmkMPerEff; }
@@ -442,7 +456,7 @@ private:
   float _alignDeg = 0, _alignSc = 0, _alignSec = 0;
   float _driveS = 0;
   // v3 turn tactics + start turn
-  enum Tac : uint8_t { TK_NONE = 0, TK_PIVOT = 1, TK_SWING = 2, TK_SHIFT = 3, TK_ARC = 4, TK_REST = 5 };
+  enum Tac : uint8_t { TK_NONE = 0, TK_PIVOT = 1, TK_SWING = 2, TK_SHIFT = 3, TK_ARC = 4, TK_REST = 5, TK_ROLL = 6 };
   uint8_t _tk = TK_NONE, _tkNext = 0, _tkCycles = 0, _floorH = 0;
   uint32_t _tkMs = 0, _tkWinMs = 0, _settleMs = 0;
   float _tkYaw = 0, _shiftM = 0, _netM = 0, _stepTgt = NAN;

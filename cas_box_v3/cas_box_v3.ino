@@ -137,10 +137,30 @@ MissionRadio radio;   // v3: phone off during the mission, double tap -> back on
 // cancel button / any drive key, no IMU, 15 s, or less than 1 deg in 2 s at full command ("no turn response").
 volatile int8_t t90Req = 0; volatile bool t90New = false;
 char t90Msg[64] = "";
+// 12.11.: ROLLING START (logs 030-033, rover 7: a pivot from standstill turned in 7 % of the tries, while rolling in
+// 51 %): the button first rolls straight at TURN90_ROLL_CMD (back if the rear is free, else forward) for
+// TURN90_ROLL_MS and then pivots at 0.5 WITHOUT stopping. No response for 2 s -> rolls again the other way (3 tries).
+const float TURN90_ROLL_CMD = 0.30f;
+const uint32_t TURN90_ROLL_MS = 1200;
 struct Turn90 {
   bool on = false; int8_t dir = 1; float prog = 0, prevYaw = 0, rate = 0, respProg = 0;
   uint32_t t0 = 0, respMs = 0, lastMs = 0;
+  bool rolling = false; int8_t rollDir = -1; uint8_t tries = 0; uint32_t rollMs = 0, rollEndMs = 0; bool carry = false;
 } t90;
+static bool t90Free(bool back) {   // LiDAR (4 deg bins, 0 = ahead) + ultrasonic 3 (back): ~0.55 m free
+  if (back) {
+    for (uint8_t i = 37; i <= 52; i++) { const uint16_t cm = sensors.lidarCm(i); if (cm > 25 && cm < 55) return false; }
+    const int b = sensors.usCm(3); return !(b > 2 && b < 40);
+  }
+  for (int8_t k = -7; k <= 7; k++) { const uint16_t cm = sensors.lidarCm((uint8_t)((k + 90) % 90)); if (cm > 25 && cm < 60) return false; }
+  return true;
+}
+static void t90Roll(uint32_t now) {   // next roll: back first, then alternating; none possible -> pivot only
+  int8_t want = t90.tries == 0 ? -1 : -t90.rollDir;
+  if (!t90Free(want < 0)) want = -want;
+  if (!t90Free(want < 0)) { t90.rolling = false; return; }
+  t90.rolling = true; t90.rollDir = want; t90.rollMs = now;
+}
 static float wrap180f(float a) { a = fmodf(a + 180.0f, 360.0f); if (a < 0) a += 360.0f; return a - 180.0f; }
 void turn90Stop(const char* why) { t90.on = false; snprintf(t90Msg, sizeof(t90Msg), "%s (%.0f deg)", why, t90.prog); Serial.printf("[turn90] %s\n", t90Msg); }
 // returns true while it drives the wheels
@@ -152,13 +172,14 @@ bool turn90Step(float padL, float padR, uint32_t padAge, float& l, float& r) {
     else if (!sensors.imuOk()) { snprintf(t90Msg, sizeof(t90Msg), "no IMU - no turn"); }
     else {
       t90 = Turn90(); t90.on = true; t90.dir = t90Req; t90.t0 = t90.respMs = t90.lastMs = now; t90.prevYaw = sensors.yawNowDeg();
-      snprintf(t90Msg, sizeof(t90Msg), "%s 90: starting", t90.dir > 0 ? "Left" : "Right");
+      t90Roll(now);
+      snprintf(t90Msg, sizeof(t90Msg), "%s 90: %s", t90.dir > 0 ? "Left" : "Right", t90.rolling ? "rolling start" : "starting");
     }
   }
   if (!t90.on) return false;
   if (padAge <= PAD_TIMEOUT_MS && (padL != 0 || padR != 0)) { turn90Stop("drive key - cancelled"); return false; }
   if (!sensors.imuOk()) { turn90Stop("IMU invalid - stopped"); return false; }
-  if (now - t90.t0 > 15000) { turn90Stop("15 s - stopped"); return false; }
+  if (now - t90.t0 > 20000) { turn90Stop("20 s - stopped"); return false; }
   const float y = sensors.yawNowDeg();
   const float dy = wrap180f(y - t90.prevYaw);
   const float dt = (now - t90.lastMs) / 1000.0f;
@@ -170,8 +191,25 @@ bool turn90Step(float padL, float padR, uint32_t padAge, float& l, float& r) {
   const float coast = fminf(TURN90_STOP_EARLY_MAX, fabsf(t90.rate) * 0.45f);
   if (t90.prog >= 90.0f - coast) { turn90Stop("done"); return false; }
   if (t90.prog - t90.respProg >= 1.0f) { t90.respProg = t90.prog; t90.respMs = now; }
-  if (now - t90.respMs > 2000 && now - t90.t0 > 1500) { turn90Stop("no turn response - stopped"); return false; }
-  l = -t90.dir * PIVOT_CMD; r = t90.dir * PIVOT_CMD;
+  if (t90.rolling) {                                      // straight roll, then into the pivot without a stop
+    if (now - t90.rollMs >= TURN90_ROLL_MS || !t90Free(t90.rollDir < 0)) {
+      t90.carry = t90Free(t90.rollDir < 0);                 // still free: keep rolling INTO the pivot (fading)
+      t90.rolling = false; t90.tries++; t90.respMs = t90.rollEndMs = now; t90.respProg = t90.prog;
+    } else {
+      l = r = t90.rollDir * TURN90_ROLL_CMD;
+      snprintf(t90Msg, sizeof(t90Msg), "%s 90: rolling %s (try %u)", t90.dir > 0 ? "Left" : "Right", t90.rollDir < 0 ? "back" : "fwd", t90.tries + 1);
+      return true;
+    }
+  }
+  if (now - t90.respMs > 2000) {
+    if (t90.tries < 3) { t90Roll(now); if (t90.rolling) { t90.respMs = now; l = r = t90.rollDir * TURN90_ROLL_CMD; return true; } }
+    turn90Stop("no turn response - stopped"); return false;
+  }
+  float cv = 0;                                           // rolling speed carried into the pivot, fading over 1.2 s
+  if (t90.carry && now - t90.rollEndMs < 1200 && t90Free(t90.rollDir < 0))
+    cv = t90.rollDir * TURN90_ROLL_CMD * (1.0f - (now - t90.rollEndMs) / 1200.0f);
+  else t90.carry = false;
+  l = cv - t90.dir * PIVOT_CMD; r = cv + t90.dir * PIVOT_CMD;
   snprintf(t90Msg, sizeof(t90Msg), "%s 90: %.0f / 90 deg", t90.dir > 0 ? "Left" : "Right", t90.prog);
   return true;
 }

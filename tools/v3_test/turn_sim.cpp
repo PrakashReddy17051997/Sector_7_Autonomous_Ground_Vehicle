@@ -51,7 +51,13 @@ int main(int argc, char** argv) {
     const float dist = fabsf(v)*dt; moved += dist; if (v>0) fwd += dist; else back += dist;
     float rate = 0;
     static float sinceUnlock = 0, credit = 0;
-    if (unlockM >= 900) {                                  // free ground: a pivot >= 0.30 turns 40 deg/s at 0.5
+    static bool turning = false;
+    if (unlockM >= 600 && unlockM < 900) {                 // ROVER 7 (logs 030-033): a pivot from standstill does not
+      if (fabsf(w) < 0.30f) turning = false;               // break away; one entered while rolling does and keeps turning
+      else if (!turning && fabsf(w) >= 0.40f && fabsf(v) >= 0.05f) turning = true;
+      if (turning) rate = 40.0f * (w / 0.5f);
+      else if (fabsf(v) >= 0.05f) rate = 4.0f * w;
+    } else if (unlockM >= 900) {                                  // free ground: a pivot >= 0.30 turns 40 deg/s at 0.5
       if (fabsf(v) < 0.05f && fabsf(w) >= 0.30f) rate = 40.0f * (w / 0.5f);
       else if (fabsf(v) >= 0.05f) rate = 35.0f * w;
     } else if (unlockM < 50) {                             // "lock" model of log_031
@@ -72,3 +78,4 @@ int main(int argc, char** argv) {
   }
   printf("timeout: state %u off %.1f\n", (unsigned)rf.state(), wrap(off0+yaw));
 }
+WallFollow::Wall WallFollow::measure(const Sensors&, Side, const Wall*) const { Wall w{gStartWall, gStartD, 0, 0.02f, 20}; return w; }

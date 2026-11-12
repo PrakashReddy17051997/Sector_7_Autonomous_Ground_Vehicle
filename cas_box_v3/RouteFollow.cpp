@@ -91,6 +91,7 @@ bool RouteFollow::start(const Sensors& s, const WallFollow& wf, uint8_t i, float
   _lpYawPrev = s.yawDeg();
   _lpEffAcc = 0;
   _pitch0 = s.pitchDeg();
+  _roll0 = s.rollDeg();
   _slopeMs = 0; _xteI = 0; _ey = 0; _peInit = false; _noTurnEff = -99;
   _lpOkMs = 0;
   _speed = speed;
@@ -289,7 +290,7 @@ void RouteFollow::_control(const Sensors& s) {
   // ~10 deg and the next pivot started at once - 14 restarts for one 83 deg turn in the sim)
   if (!_pivoting && (ae >= pivotDeg || (!_tgtFwd && ae > turnDoneDeg)) && (ae >= pivotDeg + 20.0f || now - _pivotEndMs > 600)) {
     _pivoting = true; _pivotMs = now; _tapDir = dir; _hc = 0; _pivBoost = 0;
-    if (turnTactics) { _netM = 0; _tacStart(TK_PIVOT, s, now, true); }
+    if (turnTactics) { _netM = 0; _tacStart((rollStart && fabsf(_outV) < 0.12f) ? TK_ROLL : TK_PIVOT, s, now, true); }
   }
   if (_pivoting) {
     const float coast = fminf(14.0f, fabsf(_rate) * pivotCoastS);  // still turns this much after the release (Kethan: 14 deg at 0.35)
@@ -812,7 +813,7 @@ void RouteFollow::_lmkBegin() {
   _lmkWhy = "";
   for (uint8_t k = 0; k < _lmkN; k++) {
     const LmkSlot& sl = _lmkSlot[k];
-    if (sl.leg == _i && sl.ph) { _lmk.begin(sl.ph, sl.n); _lmkOn = true; _lmkLen = sl.lenM; break; }
+    if (sl.leg == _i && sl.ph) { _lmk.sideParaExtraDeg = lmkParaExtraDeg; _lmk.begin(sl.ph, sl.n); _lmkOn = true; _lmkLen = sl.lenM; break; }
   }
   if (_lmkOn) Serial.printf("[route] leg %u is a LANDMARK leg (%u phases)\n", (unsigned)(_i + 1), (unsigned)_lmk.phases());
 }
@@ -825,7 +826,10 @@ bool RouteFollow::_lmkDrive(const Sensors& s, float ry, float v) {
   const bool lpOk = _lpOn && pathLocked() && _lp.leg() == _i && _lp.sEnd() > 0.5f;
   const float sM = (lpOk && _lmkLen > 0) ? _lp.s() * _lmkLen / _lp.sEnd() : legMetres();
   const bool tilted = fabsf(s.pitchDeg() - _pitch0) > lmkTiltDeg;
-  LandmarkLeg::Out o = _lmk.step(_scan, ry, L.ref, sM, 0.25f, tilted);
+  // 12.11. (log_033, M51-M57): the pitch gate held EVERY phase on the ramp -> no left-wall steering, the rover went
+  // for the right ramp wall / the steps. Now the pitch only holds lines ahead / behind; side walls are followed.
+  const bool rolled = fabsf(s.rollDeg() - _roll0) > lmkRollDeg;
+  LandmarkLeg::Out o = _lmk.step(_scan, ry, L.ref, sM, 0.25f, tilted, rolled);
   _lmkWhy = o.why;
   // the locked localizer at the end of the taught path ends a landmark leg too (like the path legs)
   if (!o.done && lpOk && _lp.atEnd() && _eff >= pathEndMinFrac * L.effort) { o.done = true; o.why = "path end"; }
@@ -890,29 +894,32 @@ bool RouteFollow::_rearFree(const Sensors& s) const {
 
 void RouteFollow::_tacStart(uint8_t t, const Sensors& s, uint32_t now, bool first) {
   if (first) { _tkNext = 1; _tkCycles = 0; }
-  _tk = t; _tkMs = _tkWinMs = now; _tkYaw = s.yawNowDeg(); _shiftM = 0; _tkBoosted = false;
+  _tk = t; _tkMs = _tkWinMs = now; _tkYaw = s.yawNowDeg(); _shiftM = 0; _tkBoosted = false; _rollV = 0;
   // shifts alternate: back when the rover is already ahead of where the turn began (or forward is not allowed),
   // forward when it is behind -> it stays within +-fwdMoveStartM / backShiftMaxM of its start (log_031: two back
   // shifts used up the back allowance, after that only the locked pivot was left)
-  if (t == TK_SHIFT) {
+  if (t == TK_SHIFT || t == TK_ROLL) {
     const bool fwdRoom = _corridor(s, 0, 0.25f, 1.5f) > 1.0f && _floorAhead(s) && _netM < (_startTurn ? fwdMoveStartM : fwdMoveMaxM) - 0.25f;
     const bool backRoom = _rearFree(s) && -_netM < backShiftMaxM - 0.25f;
     _shiftBack = (_netM > 0.05f && backRoom) || !fwdRoom;     // back if ahead (and possible), else forward if possible
   }
-  static const char* kN[] = {"-", "pivot", "swing", "shift", "arc", "rest"};
+  static const char* kN[] = {"-", "pivot", "swing", "shift", "arc", "rest", "roll+pivot"};
   if (t != TK_REST) {
-    snprintf(_tacMsg, sizeof(_tacMsg), "turn: %s%s", kN[t], t == TK_SHIFT ? (_shiftBack ? " back" : " fwd") : "");
+    snprintf(_tacMsg, sizeof(_tacMsg), "turn: %s%s", kN[t], (t == TK_SHIFT || t == TK_ROLL) ? (_shiftBack ? " back" : " fwd") : "");
     Serial.printf("[route] %s (%.0f deg to go)\n", _tacMsg, _ctrlErr);
   }
 }
 
 void RouteFollow::_tactic(const Sensors& s, float dt, uint32_t now) {
+  // 12.11.: roll+pivot first (see ROLLING START), the older tactics after two tries
+  static const uint8_t kSeqRoll[] = {TK_ROLL, TK_ROLL, TK_ARC, TK_ROLL, TK_SWING};
   static const uint8_t kSeq[] = {TK_PIVOT, TK_SWING, TK_SHIFT, TK_PIVOT, TK_ARC, TK_SHIFT};
   // start turn (log_031 at M1: a pivot gave ~5 deg right after each shift, then locked again; swing / arc gave ~1 deg
   // and used up the forward room): only pivot <-> shift, the shifts alternating forward / back around the start point
   static const uint8_t kSeqStart[] = {TK_PIVOT, TK_SHIFT};
-  const uint8_t* seq = _startTurn ? kSeqStart : kSeq;
-  const uint8_t nSeq = _startTurn ? sizeof(kSeqStart) : sizeof(kSeq);
+  static const uint8_t kSeqStartRoll[] = {TK_ROLL};          // start (raised path): roll+pivot only, alternating back/fwd
+  const uint8_t* seq = rollStart ? (_startTurn ? kSeqStartRoll : kSeqRoll) : (_startTurn ? kSeqStart : kSeq);
+  const uint8_t nSeq = rollStart ? (_startTurn ? sizeof(kSeqStartRoll) : sizeof(kSeqRoll)) : (_startTurn ? sizeof(kSeqStart) : sizeof(kSeq));
   const float d = _tapDir;                                   // + = turn left
   const float yaw = s.yawNowDeg();
   const float moved = fabsf(_wrap(yaw - _tkYaw));
@@ -930,13 +937,46 @@ void RouteFollow::_tactic(const Sensors& s, float dt, uint32_t now) {
     return true;
   };
   switch (_tk) {
+    case TK_ROLL: {
+      // ROLLING START: straight at rollCmd (back / forward chosen in _tacStart) until the wheels really move, then
+      // straight into the pivot - no REST in between (that is the point: the turn starts while rolling)
+      const bool ok = _shiftBack ? (_rearFree(s) && -_netM < backShiftMaxM) : fwdOk;
+      if (dt > 0 && dt < 0.1f) _shiftM += fabsf(_outV) * dt;
+      if (!ok || fabsf(_outV) >= rollGoV || _shiftM >= rollMaxM || now - _tkMs > 1800) {
+        const uint8_t keepNext = _tkNext;
+        const float carry = ok ? (_shiftBack ? -rollCmd : rollCmd) : 0.0f;   // blocked: no rolling on into it
+        _tacStart(TK_PIVOT, s, now, false);
+        _tkNext = keepNext;
+        _tkBoosted = true;                                 // 0.5 at once (rover 7)
+        _rollV = carry;
+        _l = carry - turnCmd * d; _r = carry + turnCmd * d;
+        return;
+      }
+      const float v = _shiftBack ? -rollCmd : rollCmd;
+      _l = _r = v;
+      break;
+    }
     case TK_PIVOT: {
       // 11.11.: Kethan's Turn-90 (cas_box_kethan_log): 0 -> 0.35 in 1 s (MotorShaper wUp 0.35/s), kept while it turns
       // >= 1 deg per 2 s; no response -> raised to turnCmd (0.50) for one more window, then the next tactic
       const float pc = _tkBoosted ? turnCmd : kethanCmd;
-      _l = -pc * d; _r = pc * d;
-      stalled = window(2500, 2000, 1.0f);
+      // rolling start: the rolling speed stays in the command and fades out over rollCarryMs, so the wheels are
+      // still moving when the turn command arrives (the MotorShaper ramps cannot make it a pivot from rest)
+      float cv = 0;
+      if (_rollV != 0 && now - _tkMs < rollCarryMs) {
+        const bool okC = _rollV < 0 ? (_rearFree(s) && -_netM < backShiftMaxM) : fwdOk;
+        cv = okC ? _rollV * (1.0f - (float)(now - _tkMs) / rollCarryMs) : 0.0f;
+        if (!okC) _rollV = 0;
+      }
+      _l = cv - pc * d; _r = cv + pc * d;
+      stalled = window(2000, 1500, 1.0f);
       if (stalled && !_tkBoosted) { _tkBoosted = true; _tkWinMs = now; _tkYaw = yaw; stalled = false; }
+      // 12.11.: stalled with the rolling start on -> roll again at once (no REST: the next turn starts from motion)
+      if (stalled && rollStart && seq[_tkNext % nSeq] == TK_ROLL) {
+        _tkNext = (_tkNext + 1) % nSeq;
+        _tacStart(TK_ROLL, s, now, false);
+        return;
+      }
       break;
     }
     case TK_SWING:

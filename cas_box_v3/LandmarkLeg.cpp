@@ -35,7 +35,7 @@ float LandmarkLeg::_pid(float e, float dt, float sat, const LmkPhase& P) {
   return _clamp(u, -sat, sat);
 }
 
-LandmarkLeg::Out LandmarkLeg::step(const uint16_t* scan, float ry, float ref, float s, float dt, bool tilted) {
+LandmarkLeg::Out LandmarkLeg::step(const uint16_t* scan, float ry, float ref, float s, float dt, bool tilted, bool rolled) {
   Out o;
   o.yawDes = ref;
   if (!_ph || _done) { o.done = true; o.why = "done"; return o; }
@@ -45,13 +45,15 @@ LandmarkLeg::Out LandmarkLeg::step(const uint16_t* scan, float ry, float ref, fl
   if (_p >= _n) { _done = true; o.done = true; o.why = "distance end"; return o; }
   const LmkPhase& P = _ph[_p];
   if (s < P.sFrom || P.type == HOLD) { _dPrev = -1; o.hold = true; o.why = "hold"; return o; }
-  if (tilted) { _dPrev = -1; _gap(o, ref, dt); o.why = "on slope: hold"; return o; }
+  const bool aheadBehind = P.type == ANCHOR || P.type == STOP;
+  if (rolled || (tilted && aheadBehind)) { _dPrev = -1; _gap(o, ref, dt); o.why = rolled ? "side slope: hold" : "on slope: hold"; return o; }
 
   const LineFeat::Line L = _line(scan, P.footExp, P.dMin, P.dMax, P.minLen);
   // course the line stands for, and is it parallel to the leg course? (a bike rack is not)
   const float lineYaw = wrap180(ry - wrap180(P.footExp - L.foot));
   const float refLine = wrap180(ref + P.lineOff);          // where the line runs when on course
-  const bool ok = L.ok && fabsf(wrap180(lineYaw - refLine)) <= P.paraDeg;
+  const float para = P.paraDeg + ((P.type == ANCHOR || P.type == STOP) ? 0.0f : sideParaExtraDeg);
+  const bool ok = L.ok && fabsf(wrap180(lineYaw - refLine)) <= para;
   const float courseFromLine = wrap180(lineYaw - P.lineOff);  // the leg course as this line sees it
   const float sideSign = P.footExp > 0 ? 1.0f : -1.0f;   // + yaw = towards a LEFT line
   if (ok) _lastD = L.d;
@@ -108,7 +110,7 @@ LandmarkLeg::Out LandmarkLeg::step(const uint16_t* scan, float ry, float ref, fl
       // (taught right distance in a). Both: middle of the corridor; one: keep its taught distance; none: hold.
       const LineFeat::Line R = _line(scan, -90.0f, 0.3f, P.a + 1.5f, P.minLen);
       const float rYaw = wrap180(ry - wrap180(-90.0f - R.foot));
-      const bool rOk = R.ok && fabsf(wrap180(rYaw - refLine)) <= P.paraDeg;
+      const bool rOk = R.ok && fabsf(wrap180(rYaw - refLine)) <= para;
       float e; float course;
       if (ok && rOk) {                       // + e = closer to the right wall than the middle -> steer left
         e = 0.5f * ((L.d - R.d) - (P.dRef - P.a));    // taught asymmetry kept (the taught track was not centred)
