@@ -351,6 +351,7 @@ void loop() {
   // v3 (log_030): turn tactics need full turn power quickly (Arjun: pivots worked 36 % with full power at once,
   // 13 % with a slow ramp) - 0 -> 0.50 in 0.25 s while a tactic turn runs; the stop ramp stays gentle (wDown)
   shaper.wUp = 0.50f;   // 11.11.: every pivot 0 -> 0.5 in 1 s (Kethan's 1 s ramp, rover 7 needs 0.5)
+  shaper.wheelRamp = mission.active() && mission.route.wheelRamp();   // 12.11.: K-turn pieces keep their curve
   shaper.apply(l, r, safetyReason != SafetyGuard::OK);   // gradual; a guard stop (obstacle / tilt) drops the speed at once
 
   rover.setDrive(l, r);                 // every loop pass, after guard and shaper

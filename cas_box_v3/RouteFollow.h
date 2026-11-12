@@ -227,6 +227,20 @@ public:
   // -> 20 deg in 1 s. So every turn on the spot starts by rolling straight (back if the rear is free, else forward)
   // and goes into the 0.5 pivot WITHOUT stopping (MotorShaper: the speed fades over 2 s while the turn rises in 1 s).
   // Stalls -> roll again (alternating back / forward, the rover stays within the back / forward limits).
+  // K-TURN (12.11. evening, logs 030-034 of rover 7, 7900 samples sorted by wheel direction):
+  //   wheels OPPOSITE (every pivot, also the rolling start): median 0 deg/s - rover 7 cannot turn on the spot
+  //   both wheels FORWARD  (curve): 16.7 deg/s per unit w = (r - l)/2   -> l 0.05 / r 0.50: ~3.6 deg/s
+  //   both wheels BACKWARD (curve): 31 deg/s per unit w (16 samples)     -> l -0.50 / r -0.05: ~7 deg/s
+  // So every turn is made like a car turning in a narrow street: curve FORWARD with the inner wheel slow, then curve
+  // BACKWARD with the other wheel slow (the body keeps rotating the same way), and again - until the heading is
+  // reached. Each piece ends after kSegM, kSegMs or when the LiDAR / ultrasonics see no room in that direction; the
+  // pieces alternate so the rover stays near where it started (net forward / backward limits as for the shifts).
+  // Used for the start turn, every corner pivot and the obstacle detour turns. kTurn = false: the old tactics.
+  bool kTurn = true;
+  float kOuter = 0.50f;               // outer wheel (the fast one), forward or backward
+  float kInner = 0.05f;               // inner wheel, same direction (>= 0: never opposite = never a pivot)
+  float kSegM = 0.40f;                // one piece at most this far (odometry, 1 m/s per unit)
+  uint32_t kSegMs = 5000;             // ... or this long
   bool rollStart = true;
   float rollCmd = 0.30f;              // rolling speed before the pivot
   float rollMaxM = 0.30f;             // roll at most this far per try (it pivots as soon as it moves at rollGoV)
@@ -245,6 +259,7 @@ public:
   // a locked path localizer must agree that the leg is (nearly) done: s >= lpEndAgreeFrac * sEnd - 0.5 m (log_031)
   float lpEndAgreeFrac = 0.85f;         // start alignment: turn steps (<= 90 deg each) + LiDAR re-checks
   bool tacticActive() const { return active() && _pivoting && turnTactics; }   // -> fast turn ramp in MotorShaper
+  bool wheelRamp() const { return tacticActive() && _tk == TK_KTURN; }   // -> MotorShaper ramps each WHEEL (keeps the curve)
   const char* tacticMsg() const { return _tacMsg; }
   // ---- v4 (11.11., tools/v4_test/obstacle_sim on the real route code) ------------------------------
   // SMART OBSTACLES. v3 saw a NEW thing on the locked path only inside hardStopM (0.45 m) and then braked with the
@@ -264,7 +279,8 @@ public:
   float avMinClearM = 0.30f;      // ... at least this far when the diagonal runs out of room (wall beside)
   float avMaxShiftM = 1.2f;       // never further off the line than this (open edges: noRight legs, raised path)
   float avMaxWidthM = 1.5f;       // wider: a wall across -> no detour (wait / pause as before)
-  float avAngleDeg = 45.0f;       // OUT / BACK direction relative to the line
+  float avAngleDeg = 30.0f;          // 12.11.: was 45 - the K-turn back to parallel drifts ~0.2 m towards the
+                                      // obstacle; 30 deg needs less turning (sim: box on the path passes, 45 hit it); OUT / BACK direction vs the line
   float avMoveM = 0.10f;          // obstacle moved more than this between scans while we stand: it is moving
   uint32_t staticMs = 750;        // ... not moved for this long: static -> detour now
   float avMinScore = 0.6f;        // early (1.5 m) detection only with a LiDAR match at least this good
@@ -456,7 +472,7 @@ private:
   float _alignDeg = 0, _alignSc = 0, _alignSec = 0;
   float _driveS = 0;
   // v3 turn tactics + start turn
-  enum Tac : uint8_t { TK_NONE = 0, TK_PIVOT = 1, TK_SWING = 2, TK_SHIFT = 3, TK_ARC = 4, TK_REST = 5, TK_ROLL = 6 };
+  enum Tac : uint8_t { TK_NONE = 0, TK_PIVOT = 1, TK_SWING = 2, TK_SHIFT = 3, TK_ARC = 4, TK_REST = 5, TK_ROLL = 6, TK_KTURN = 7 };
   uint8_t _tk = TK_NONE, _tkNext = 0, _tkCycles = 0, _floorH = 0;
   uint32_t _tkMs = 0, _tkWinMs = 0, _settleMs = 0;
   float _tkYaw = 0, _shiftM = 0, _netM = 0, _stepTgt = NAN;
@@ -464,6 +480,10 @@ private:
   bool _vetoLogged = false;
   float _settleYaw = 0;
   bool _shiftBack = false, _floorOk = false, _startTurn = false, _tkBoosted = false;
+  float _odo = 0;                     // signed travel (forward +, backward -), effort units: detour dead reckoning
+  uint32_t _guardMs = 0;             // since when the safety stop holds the wheels while DRIVE asks forward
+  int8_t _kDir = 0;                   // K-turn: direction of the last segment (+1 forward, -1 backward, 0 none yet)
+  float _kYaw0 = 0;                   // K-turn: gyro at the start of the turn (progress check)
   uint8_t _climbN = 0;
   uint32_t _climbUntil = 0;
   uint8_t _startRounds = 0;
@@ -471,6 +491,8 @@ private:
   bool _floorAhead(const Sensors& s);
   bool _rearFree(const Sensors& s) const;
   void _tacStart(uint8_t t, const Sensors& s, uint32_t now, bool first);
+  bool _kFwdRoom(const Sensors& s, float margin) const;
+  bool _kBackRoom(const Sensors& s, float margin) const;
   void _tactic(const Sensors& s, float dt, uint32_t now);
   void _startTurnStep(const Sensors& s, float ry, uint32_t now);                  // rolling time since boot (trim learning: fast for the first 40 s)
   LandmarkLeg _lmk;

@@ -1,0 +1,4 @@
+# simulator build outputs (make them with build.sh / rover_sim)
+build/
+out/
+rover_sim

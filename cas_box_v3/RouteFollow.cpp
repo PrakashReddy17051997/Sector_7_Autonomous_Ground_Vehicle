@@ -143,6 +143,7 @@ void RouteFollow::feedOutput(float l, float r) {
   _outV = v;                                  // what REALLY went to the wheels (stuck check)
   _outW = 0.5f * (r - l);                     // turn that really went to the wheels (pivot stuck check)
   if (v > 0) { _eff += v * dt; _lpEffAcc += v * dt; }
+  _odo += v * dt;                             // 12.11.: signed (backward counts minus) - detour dead reckoning
 }
 
 // path heading error (rad, + = left): straight line to the next corner of the taught path at least
@@ -290,7 +291,7 @@ void RouteFollow::_control(const Sensors& s) {
   // ~10 deg and the next pivot started at once - 14 restarts for one 83 deg turn in the sim)
   if (!_pivoting && (ae >= pivotDeg || (!_tgtFwd && ae > turnDoneDeg)) && (ae >= pivotDeg + 20.0f || now - _pivotEndMs > 600)) {
     _pivoting = true; _pivotMs = now; _tapDir = dir; _hc = 0; _pivBoost = 0;
-    if (turnTactics) { _netM = 0; _tacStart((rollStart && fabsf(_outV) < 0.12f) ? TK_ROLL : TK_PIVOT, s, now, true); }
+    if (turnTactics) { _netM = 0; _kDir = 0; _kYaw0 = s.yawNowDeg(); _tacStart(kTurn ? TK_PIVOT : ((rollStart && fabsf(_outV) < 0.12f) ? TK_ROLL : TK_PIVOT), s, now, true); }
   }
   if (_pivoting) {
     const float coast = fminf(14.0f, fabsf(_rate) * pivotCoastS);  // still turns this much after the release (Kethan: 14 deg at 0.35)
@@ -499,12 +500,29 @@ void RouteFollow::_step(const Sensors& s, const WallFollow& wf) {
     snprintf(_msg, sizeof(_msg), "stuck (v %.2f w %.2f) - backing up", _outV, _outW);
     Serial.println("[route] stuck -> back up");
   }
+  // 12.11. (tools/sim_v3): the SafetyGuard holds the wheels (something < 30 cm ahead) while the route keeps asking
+  // forward -> nothing moves, the stuck check above never counts (it needs moving wheels) = endless wait. After 2.5 s
+  // back up (if the rear is free), then the route tries again.
+  if (_state == DRIVE && 0.5f * (_l + _r) > 0.05f && fabsf(_outV) < 0.01f) { if (!_guardMs) _guardMs = now; }
+  else _guardMs = 0;
+  if (_guardMs && now - _guardMs > 2500) {
+    _guardMs = 0;
+    if (++_backups >= maxBackups) { pause("held by the safety stop - help me, then Resume"); return; }
+    if (_rearFree(s)) {
+      _state = BACKUP; _stateMs = now; _climbUntil = 0;
+      strlcpy(_msg, "held by the safety stop - backing up", sizeof(_msg));
+      Serial.println("[route] safety stop holds the wheels -> back up");
+    }
+  }
 
   switch (_state) {
     case BACKUP:
       if (now < _climbUntil) { _l = _r = climbPow; return; }               // climb push first
       if (_climbUntil != 0 && now - _climbUntil < 300) { _l = _r = 0; return; }
       if (_climbUntil != 0) { _climbUntil = 0; _state = DRIVE; return; }   // after the push: drive on (check again)
+      // 12.11. (found with tools/sim_v3): the climb-push change of 11.11. had deleted this line - since then "backing
+      // up" never reversed, it kept the last command (often forward into the wall)
+      _l = _r = -backupCmd;
       if (now - _stateMs >= 2500) { _state = DRIVE; _l = _r = 0; }
       return;
 
@@ -892,20 +910,41 @@ bool RouteFollow::_rearFree(const Sensors& s) const {
   return !(b > 2 && b < 40);
 }
 
+// K-turn room: forward = corridor ahead (rover-wide) longer than 0.45 m, floor seen, within the forward limit;
+// backward = rear free (LiDAR + back ultrasonic, _rearFree) and within the backward limit. margin = keep this much
+// of the limit for the next piece.
+bool RouteFollow::_kFwdRoom(const Sensors& s, float margin) const {
+  return _corridor(s, 0, 0.22f, 1.0f) > 0.45f && _floorOk && _netM < (_startTurn ? fwdMoveStartM : fwdMoveMaxM) - margin;
+}
+bool RouteFollow::_kBackRoom(const Sensors& s, float margin) const {
+  return _rearFree(s) && -_netM < backShiftMaxM - margin;
+}
+
 void RouteFollow::_tacStart(uint8_t t, const Sensors& s, uint32_t now, bool first) {
   if (first) { _tkNext = 1; _tkCycles = 0; }
   _tk = t; _tkMs = _tkWinMs = now; _tkYaw = s.yawNowDeg(); _shiftM = 0; _tkBoosted = false; _rollV = 0;
   // shifts alternate: back when the rover is already ahead of where the turn began (or forward is not allowed),
   // forward when it is behind -> it stays within +-fwdMoveStartM / backShiftMaxM of its start (log_031: two back
   // shifts used up the back allowance, after that only the locked pivot was left)
+  if (t == TK_KTURN) {
+    // next piece: the other direction than the last one if there is room, else the same, else none (wait)
+    const bool fwdRoom = _kFwdRoom(s, 0.10f);
+    const bool backRoom = _kBackRoom(s, 0.10f);
+    int8_t want = _kDir == 0 ? (backRoom ? -1 : 1) : (int8_t)-_kDir;
+    if ((want < 0 && !backRoom) || (want > 0 && !fwdRoom)) want = (int8_t)-want;
+    if ((want < 0 && !backRoom) || (want > 0 && !fwdRoom)) want = 0;
+    _kDir = want;
+    _shiftBack = want < 0;
+  }
   if (t == TK_SHIFT || t == TK_ROLL) {
     const bool fwdRoom = _corridor(s, 0, 0.25f, 1.5f) > 1.0f && _floorAhead(s) && _netM < (_startTurn ? fwdMoveStartM : fwdMoveMaxM) - 0.25f;
     const bool backRoom = _rearFree(s) && -_netM < backShiftMaxM - 0.25f;
     _shiftBack = (_netM > 0.05f && backRoom) || !fwdRoom;     // back if ahead (and possible), else forward if possible
   }
-  static const char* kN[] = {"-", "pivot", "swing", "shift", "arc", "rest", "roll+pivot"};
+  static const char* kN[] = {"-", "pivot", "swing", "shift", "arc", "rest", "roll+pivot", "K-turn"};
   if (t != TK_REST) {
-    snprintf(_tacMsg, sizeof(_tacMsg), "turn: %s%s", kN[t], (t == TK_SHIFT || t == TK_ROLL) ? (_shiftBack ? " back" : " fwd") : "");
+    snprintf(_tacMsg, sizeof(_tacMsg), "turn: %s%s", kN[t], (t == TK_SHIFT || t == TK_ROLL) ? (_shiftBack ? " back" : " fwd") :
+             t == TK_KTURN ? (_kDir < 0 ? " backward curve" : (_kDir > 0 ? " forward curve" : " - no room, waiting")) : "");
     Serial.printf("[route] %s (%.0f deg to go)\n", _tacMsg, _ctrlErr);
   }
 }
@@ -937,6 +976,30 @@ void RouteFollow::_tactic(const Sensors& s, float dt, uint32_t now) {
     return true;
   };
   switch (_tk) {
+    case TK_KTURN: {
+      // one piece of the K-turn: both wheels the same direction, the outer one fast (see K-TURN in RouteFollow.h)
+      if (dt > 0 && dt < 0.1f) _shiftM += fabsf(_outV) * dt;
+      const bool back = _kDir < 0;
+      if (_kDir == 0) {                                     // no room either way: stand, look again every 1 s
+        if (now - _tkMs > 1000) _tacStart(TK_KTURN, s, now, false);
+        return;
+      }
+      // a piece ends when the room in its direction is used up, or the rover is kSegM/2 past where the turn began
+      // (forward and backward pieces then balance: it stays within +-0.2 m) - unless the other direction has no
+      // room, then it goes on up to the forward / backward limits
+      const bool ok = back ? _kBackRoom(s, 0.0f) : _kFwdRoom(s, 0.0f);
+      const bool otherRoom = back ? _kFwdRoom(s, 0.10f) : _kBackRoom(s, 0.10f);
+      const bool half = back ? (_netM <= -0.5f * kSegM) : (_netM >= 0.5f * kSegM);
+      if (!ok || (half && otherRoom && _shiftM > 0.1f) || _shiftM >= 2.0f * kSegM || now - _tkMs > kSegMs) {
+        _tacStart(TK_KTURN, s, now, false);
+        return;
+      }
+      // turning left (d > 0): forward = right wheel fast; backward = LEFT wheel fast backward (r - l > 0 both times)
+      const float o = kOuter, in = kInner;
+      if (!back) { if (d > 0) { _l = in; _r = o; } else { _l = o; _r = in; } }
+      else       { if (d > 0) { _l = -o; _r = -in; } else { _l = -in; _r = -o; } }
+      return;
+    }
     case TK_ROLL: {
       // ROLLING START: straight at rollCmd (back / forward chosen in _tacStart) until the wheels really move, then
       // straight into the pivot - no REST in between (that is the point: the turn starts while rolling)
@@ -971,6 +1034,9 @@ void RouteFollow::_tactic(const Sensors& s, float dt, uint32_t now) {
       _l = cv - pc * d; _r = cv + pc * d;
       stalled = window(2000, 1500, 1.0f);
       if (stalled && !_tkBoosted) { _tkBoosted = true; _tkWinMs = now; _tkYaw = yaw; stalled = false; }
+      // 12.11. late: Kethan's pivot is ALWAYS tried first (it turns on rover 4 / smooth floor); no turn response
+      // (< 1 deg in its windows) -> K-turn for the rest of this turn
+      if (stalled && kTurn) { _tacStart(TK_KTURN, s, now, false); return; }
       // 12.11.: stalled with the rolling start on -> roll again at once (no REST: the next turn starts from motion)
       if (stalled && rollStart && seq[_tkNext % nSeq] == TK_ROLL) {
         _tkNext = (_tkNext + 1) % nSeq;
@@ -1129,8 +1195,8 @@ bool RouteFollow::_avPlan(const Sensors& s, const Leg& L, float& shift, int8_t& 
 void RouteFollow::_avoidSmart(const Sensors& s, const Leg& L, float ry, uint32_t now) {
   for (uint8_t i = 0; i < Sensors::kLidarPoints; i++) _scan[i] = s.lidarCm(i);
   if (_avPhase >= 1) {                                           // dead-reckoned offset from the line (m, + = left)
-    const float de = (_eff - _avEffPrev) * lmkMPerEff, rel = _wrap(ry - _avBase) * DEG_TO_RAD;
-    _avEffPrev = _eff;
+    const float de = (_odo - _avEffPrev) * lmkMPerEff, rel = _wrap(ry - _avBase) * DEG_TO_RAD;
+    _avEffPrev = _odo;
     _avLat += de * sinf(rel);
     _avS += de * cosf(rel);
     if (now - _stateMs > 60000) { pause("detour took > 60 s - help me, Resume"); return; }
@@ -1153,17 +1219,17 @@ void RouteFollow::_avoidSmart(const Sensors& s, const Leg& L, float ry, uint32_t
     // re-planning in the middle of a detour: pass only once really beside it (the minimum lateral goal reached)
     if (free && _avMid && _avDir * (_avLat - _avGoalMin) >= 0) {
       if (_corridor(s, -_wrap(_avBase - ry), 0.20f, 1.0f) >= 0.60f) {   // the way parallel to the line is free
-        _avMid = false; _avPhase = 2; _avEffPrev = _eff; strlcpy(_msg, "obstacle - passing", sizeof(_msg)); return;
+        _avMid = false; _avPhase = 2; _avEffPrev = _odo; strlcpy(_msg, "obstacle - passing", sizeof(_msg)); return;
       }
       const float g = _avLat + _avDir * 0.20f;                   // the corner is still in the way: 0.2 m further out
       if (fabsf(g) <= avMaxShiftM) {
-        _avGoal = _avGoalMin = g; _avMid = false; _avPhase = 1; _avEffPrev = _eff;
+        _avGoal = _avGoalMin = g; _avMid = false; _avPhase = 1; _avEffPrev = _odo;
         strlcpy(_msg, "obstacle - a bit further out", sizeof(_msg)); return;
       }
     }
     if (_avMid && _avTries >= 7) { pause("detour blocked - help me, then Resume"); return; }
     if (free && _avMid && _avPhase0Out()) {                       // not beside it yet: carry on OUT to the planned offset
-      _avPhase = 1; _avEffPrev = _eff; _avMid = false; strlcpy(_msg, "obstacle - detour (going on)", sizeof(_msg)); return;
+      _avPhase = 1; _avEffPrev = _odo; _avMid = false; strlcpy(_msg, "obstacle - detour (going on)", sizeof(_msg)); return;
     }
     if (free) { _avMid = false; _state = DRIVE; strlcpy(_msg, "way free again", sizeof(_msg)); return; }
     // moving or standing? (judged only when the rover itself stands)
@@ -1181,6 +1247,14 @@ void RouteFollow::_avoidSmart(const Sensors& s, const Leg& L, float ry, uint32_t
     float shift, along; int8_t dir;
     if (!_avPlan(s, L, shift, dir, along)) {
       if (now - _stateMs < 3000) return;
+      // 12.11. (tools/sim_v3): too close to curve out of the way (rover 7 cannot turn on the spot) -> back up
+      // straight ~0.5 m (BACKUP: 2.5 s at backupCmd) and plan again from there
+      if (_avTries < 2 && _rearFree(s) && fr < 1.0f && !(L.end == END_FRONT && _eff >= 0.3f * L.effort)) {
+        _avTries++; _state = BACKUP; _stateMs = now; _climbUntil = 0;
+        strlcpy(_msg, "obstacle too close to go round - backing up", sizeof(_msg));
+        Serial.println("[route] obstacle: no room to curve out -> back up and plan again");
+        return;
+      }
       if (++_avTries >= 3) { pause("blocked - help me, then Resume"); return; }
       _stateMs = now;                                            // wait another 3 s, then plan again
       return;
@@ -1191,7 +1265,7 @@ void RouteFollow::_avoidSmart(const Sensors& s, const Leg& L, float ry, uint32_t
     _avGoal = _clamp(_avLat + dir * shift, -avMaxShiftM, avMaxShiftM);   // lateral goal of OUT (m, + = left)
     _avGoalMin = _avLat + dir * fmaxf(shift - (avClearM - avMinClearM), 0.2f);   // enough if the diagonal runs out
     _avAlong = _avS + along;                                     // where the obstacle is, along the line
-    _avEffPrev = _eff;
+    _avEffPrev = _odo;
     _avPhase = 1; _avTries++; _stateMs = now;
     snprintf(_msg, sizeof(_msg), "obstacle - detour %s (%.0f cm)", dir > 0 ? "left" : "right", shift * 100.0f);
     return;
@@ -1335,7 +1409,7 @@ bool RouteFollow::_rrTry(const Sensors& s, const Leg& L, float ry, float front, 
   }
   if (bestCost > 1e8f) return false;
   if (fresh) { _avBase = base; _avS = 0; _avLat = yNow; _avTries = 0; }
-  _avEffPrev = _eff;
+  _avEffPrev = _odo;
   _rc = best;
   _avAlong = sNow + front;
   _avDir = best.g > yNow ? 1 : -1;

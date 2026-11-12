@@ -1,0 +1,246 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Rover Simulation</title>
+<style>
+:root {
+  --bg: #f6f7f9; --panel: #ffffff; --ink: #1d2330; --muted: #667085; --line: #d9dee7;
+  --wall: #8a94a6; --path: #2f6fde; --traj: #e08a1e; --rover: #111827; --obst: #d92d20; --scan: #12b76a;
+  --st-turn: #f79009; --st-drive: #2f6fde; --st-avoid: #d92d20; --st-back: #7a5af8; --st-pause: #98a2b3;
+}
+@media (prefers-color-scheme: dark) { :root:not([data-theme="light"]) {
+  --bg: #0d1117; --panel: #161b22; --ink: #e6edf3; --muted: #8b949e; --line: #30363d;
+  --wall: #6e7681; --path: #58a6ff; --traj: #f0a040; --rover: #f0f6fc; --obst: #ff6b5b; --scan: #3fb950;
+} }
+:root[data-theme="dark"] {
+  --bg: #0d1117; --panel: #161b22; --ink: #e6edf3; --muted: #8b949e; --line: #30363d;
+  --wall: #6e7681; --path: #58a6ff; --traj: #f0a040; --rover: #f0f6fc; --obst: #ff6b5b; --scan: #3fb950;
+}
+* { box-sizing: border-box; }
+body { margin: 0; background: var(--bg); color: var(--ink); font: 14px/1.4 -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; }
+.wrap { display: grid; grid-template-columns: 1fr 360px; height: 100vh; }
+@media (max-width: 860px) { .wrap { grid-template-columns: 1fr; height: auto; } .left { height: auto; } #cv { height: 55vh; flex: none; } }
+.left { display: flex; flex-direction: column; height: 100vh; min-width: 0; }
+#cv { width: 100%; flex: 1 1 auto; min-height: 0; display: block; cursor: grab; }
+#ch { width: 100%; height: 210px; flex: 0 0 210px; display: block; border-top: 1px solid var(--line); cursor: crosshair; background: var(--panel); }
+.side { background: var(--panel); border-left: 1px solid var(--line); padding: 14px 16px; overflow: auto; height: 100vh; }
+@media (max-width: 860px) { .side { height: auto; border-left: 0; border-top: 1px solid var(--line); } }
+h1 { font-size: 16px; margin: 0 0 4px; }
+.sum { color: var(--muted); font-size: 12.5px; margin-bottom: 10px; word-break: break-word; }
+.ctrl { display: flex; flex-wrap: wrap; gap: 6px; align-items: center; margin: 8px 0; }
+button, select { background: var(--bg); color: var(--ink); border: 1px solid var(--line); border-radius: 6px; padding: 5px 9px; font: inherit; cursor: pointer; }
+input[type=range] { width: 100%; }
+label.tg { font-size: 12.5px; color: var(--muted); display: inline-flex; gap: 4px; align-items: center; }
+.kv { display: grid; grid-template-columns: 92px 1fr; gap: 3px 8px; font-size: 13px; margin: 8px 0; }
+.kv div:nth-child(odd) { color: var(--muted); }
+.msg { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 12px; background: var(--bg); border: 1px solid var(--line); border-radius: 6px; padding: 6px 8px; min-height: 34px; word-break: break-word; }
+.bars { display: grid; grid-template-columns: 52px 1fr 1fr; gap: 3px 6px; font-size: 12px; align-items: center; margin: 6px 0 10px; }
+.bar { position: relative; height: 10px; background: var(--bg); border: 1px solid var(--line); border-radius: 3px; }
+.bar i { position: absolute; top: 0; bottom: 0; background: var(--path); }
+.bar b { position: absolute; left: 50%; top: -2px; bottom: -2px; width: 1px; background: var(--muted); }
+.ev { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 11.5px; border-top: 1px solid var(--line); max-height: 38vh; overflow: auto; }
+.ev div { padding: 3px 2px; border-bottom: 1px solid var(--line); cursor: pointer; }
+.ev div.now { background: color-mix(in srgb, var(--traj) 22%, transparent); }
+.ev div.bump { color: var(--obst); }
+.legend { display: flex; flex-wrap: wrap; gap: 8px; font-size: 12px; color: var(--muted); margin: 6px 0; }
+.legend span::before { content: ""; display: inline-block; width: 10px; height: 10px; border-radius: 2px; margin-right: 4px; vertical-align: -1px; background: var(--c); }
+h2 { font-size: 13px; margin: 12px 0 4px; }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <div class="left"><canvas id="cv"></canvas><canvas id="ch"></canvas></div>
+  <div class="side">
+    <h1>Rover simulation</h1>
+    <div class="sum" id="sum"></div>
+    <div class="ctrl">
+      <button id="play">▶ Play</button>
+      <select id="spd"><option>1</option><option>2</option><option selected>4</option><option>8</option><option>16</option><option>32</option></select>
+      <span style="color:var(--muted);font-size:12px">× speed</span>
+      <button id="fit">Fit drive</button><button id="fitall">Whole map</button>
+    </div>
+    <input type="range" id="tl" min="0" max="0" value="0">
+    <div class="ctrl">
+      <label class="tg"><input type="checkbox" id="follow"> follow rover</label>
+      <label class="tg"><input type="checkbox" id="scan" checked> LiDAR</label>
+      <label class="tg"><input type="checkbox" id="trail" checked> track</label>
+      <label class="tg"><input type="checkbox" id="ghost" checked> poses</label>
+    </div>
+    <div class="legend">
+      <span style="--c:var(--st-turn)">TURN</span><span style="--c:var(--st-drive)">DRIVE</span><span style="--c:var(--st-avoid)">AVOID</span>
+      <span style="--c:var(--st-back)">BACKUP</span><span style="--c:var(--st-pause)">PAUSED</span><span style="--c:var(--obst)">obstacle</span>
+    </div>
+    <div class="kv">
+      <div>time</div><div id="kt"></div>
+      <div>state / leg</div><div id="ks"></div>
+      <div>heading err</div><div id="ke"></div>
+    </div>
+    <div class="bars">
+      <div></div><div style="color:var(--muted)">asked (RouteFollow)</div><div style="color:var(--muted)">wheels (after shaper)</div>
+      <div>left</div><div class="bar"><b></b><i id="bcl"></i></div><div class="bar"><b></b><i id="bol"></i></div>
+      <div>right</div><div class="bar"><b></b><i id="bcr"></i></div><div class="bar"><b></b><i id="bor"></i></div>
+    </div>
+    <div class="msg" id="km"></div>
+    <h2>Firmware messages (click = jump)</h2>
+    <div class="ev" id="ev"></div>
+  </div>
+</div>
+<script>
+const D = /*SIMDATA*/null;
+const ST = ["OFF", "TURN", "DRIVE", "AVOID", "BACKUP", "PAUSED", "DONE"];
+const css = n => getComputedStyle(document.documentElement).getPropertyValue(n).trim();
+const stCol = s => css(["--st-pause", "--st-turn", "--st-drive", "--st-avoid", "--st-back", "--st-pause", "--st-pause"][s] || "--st-pause");
+const cv = document.getElementById("cv"), cx = cv.getContext("2d");
+const F = D.frames, N = F.length;
+document.getElementById("sum").textContent = D.summary + "  ·  " + D.args;
+const tl = document.getElementById("tl"); tl.max = Math.max(0, N - 1);
+let idx = 0, playing = false, view = { s: 30, ox: 0, oy: 0 };
+
+// bounds of everything
+let minX = 1e9, minY = 1e9, maxX = -1e9, maxY = -1e9;
+const grow = (x, y) => { minX = Math.min(minX, x); minY = Math.min(minY, y); maxX = Math.max(maxX, x); maxY = Math.max(maxY, y); };
+let bAll, bDrive;
+D.path.forEach(p => { for (let i = 0; i < p.length; i += 2) grow(p[i] / 100, p[i + 1] / 100); });
+F.forEach(f => grow(f[1], f[2]));
+bAll = [minX, minY, maxX, maxY];
+minX = 1e9; minY = 1e9; maxX = -1e9; maxY = -1e9;
+F.forEach(f => grow(f[1], f[2])); D.obst.forEach(o => { grow(o[0] - o[2], o[1] - o[2]); grow(o[0] + o[2], o[1] + o[2]); });
+bDrive = [minX, minY, maxX, maxY];
+function fit(all) {
+  [minX, minY, maxX, maxY] = all ? bAll : bDrive;
+  const w = cv.clientWidth, h = cv.clientHeight, pad = all ? 2 : 1.5;
+  view.s = Math.min(w / (maxX - minX + 2 * pad), h / (maxY - minY + 2 * pad));
+  view.ox = w / 2 - view.s * (minX + maxX) / 2; view.oy = h / 2 + view.s * (minY + maxY) / 2;
+}
+const X = x => view.ox + view.s * x, Y = y => view.oy - view.s * y;
+
+const ch = document.getElementById("ch"), hx = ch.getContext("2d");
+function resize() { const r = window.devicePixelRatio || 1; cv.width = cv.clientWidth * r; cv.height = cv.clientHeight * r; cx.setTransform(r, 0, 0, r, 0, 0);
+  ch.width = ch.clientWidth * r; ch.height = ch.clientHeight * r; hx.setTransform(r, 0, 0, r, 0, 0); }
+// time chart: heading error to the target (deg) and the two wheel outputs (after the MotorShaper)
+function chart() {
+  const w = ch.clientWidth, h = ch.clientHeight, L = 44, R = 10, T = 18, Bm = 22, t1 = F[N - 1][0] || 1;
+  hx.fillStyle = css("--panel"); hx.fillRect(0, 0, w, h);
+  const X2 = t => L + (w - L - R) * t / t1;
+  const top = T, mid = T + (h - T - Bm) * 0.55, bot = h - Bm;
+  const Ye = e => top + (mid - top) * (0.5 - Math.max(-180, Math.min(180, e)) / 360);   // heading error +-180
+  const Yw = v => mid + 8 + (bot - mid - 8) * (0.5 - v / 1.0);                            // wheel -0.5..0.5
+  // state bands
+  for (let i = 1; i < N; i++) { hx.fillStyle = stCol(F[i][4]); hx.globalAlpha = 0.18; hx.fillRect(X2(F[i - 1][0]), top, X2(F[i][0]) - X2(F[i - 1][0]) + 1, bot - top); }
+  hx.globalAlpha = 1; hx.strokeStyle = css("--line"); hx.lineWidth = 1;
+  [[Ye(0), "0°"], [Ye(90), "90°"], [Ye(-90), "-90°"], [Yw(0), "0"], [Yw(0.5), "+0.5"], [Yw(-0.5), "-0.5"]].forEach(([y, s]) => { hx.beginPath(); hx.moveTo(L, y); hx.lineTo(w - R, y); hx.stroke(); hx.fillStyle = css("--muted"); hx.font = "10px sans-serif"; hx.fillText(s, 4, y + 3); });
+  const line = (fy, col, wd) => { hx.strokeStyle = col; hx.lineWidth = wd; hx.beginPath(); F.forEach((f, i) => { const x = X2(f[0]), y = fy(f); i ? hx.lineTo(x, y) : hx.moveTo(x, y); }); hx.stroke(); };
+  line(f => Ye(f[12]), css("--traj"), 1.6);
+  line(f => Yw(f[8]), css("--path"), 1.2);
+  line(f => Yw(f[9]), css("--st-avoid"), 1.2);
+  hx.font = "11px sans-serif"; hx.fillStyle = css("--traj"); hx.fillText("heading error to target (deg)", L + 4, top - 5);
+  hx.fillStyle = css("--path"); hx.fillText("left wheel", L + 4, mid + 6); hx.fillStyle = css("--st-avoid"); hx.fillText("right wheel", L + 74, mid + 6);
+  hx.fillStyle = css("--muted"); for (let s = 0; s <= t1; s += t1 > 200 ? 50 : (t1 > 60 ? 20 : 10)) hx.fillText(s + " s", X2(s) - 8, h - 6);
+  const f = F[idx]; if (f) { hx.strokeStyle = css("--ink"); hx.lineWidth = 1.5; hx.beginPath(); hx.moveTo(X2(f[0]), top); hx.lineTo(X2(f[0]), bot); hx.stroke(); }
+}
+ch.addEventListener("pointerdown", e => { const r = ch.getBoundingClientRect(), t1 = F[N - 1][0] || 1, t = (e.clientX - r.left - 44) / (r.width - 54) * t1; let i = 0; while (i < N - 1 && F[i][0] < t) i++; idx = i; tl.value = i; draw(); });
+// walls into an offscreen layer is overkill here: draw cells as small squares
+function draw() {
+  const f = F[idx]; if (!f) return;
+  if (document.getElementById("follow").checked) { const w = cv.clientWidth, h = cv.clientHeight; view.ox = w / 2 - view.s * f[1]; view.oy = h / 2 + view.s * f[2]; }
+  cx.fillStyle = css("--bg"); cx.fillRect(0, 0, cv.clientWidth, cv.clientHeight);
+  // walls
+  cx.fillStyle = css("--wall"); const c = Math.max(1, view.s * 0.1);
+  for (let i = 0; i < D.walls.length; i += 2) { const x = X(D.walls[i] * 0.1), y = Y(D.walls[i + 1] * 0.1 + 0.1); if (x > -c && y > -c && x < cv.clientWidth && y < cv.clientHeight) cx.fillRect(x, y, c, c); }
+  // taught path + leg numbers
+  cx.strokeStyle = css("--path"); cx.lineWidth = 2; cx.fillStyle = css("--path"); cx.font = "12px sans-serif";
+  D.path.forEach((p, k) => {
+    cx.beginPath(); for (let i = 0; i < p.length; i += 2) { const x = X(p[i] / 100), y = Y(p[i + 1] / 100); i ? cx.lineTo(x, y) : cx.moveTo(x, y); } cx.stroke();
+    cx.beginPath(); cx.arc(X(p[0] / 100), Y(p[1] / 100), 4, 0, 7); cx.fill(); cx.fillText("L" + (k + 1), X(p[0] / 100) + 6, Y(p[1] / 100) - 6);
+  });
+  // obstacles
+  D.obst.forEach(o => {
+    const on = f[0] >= o[3] && (o[4] < 0 || f[0] <= o[4]);
+    cx.beginPath(); cx.arc(X(o[0]), Y(o[1]), o[2] * view.s, 0, 7);
+    cx.fillStyle = on ? css("--obst") : "transparent"; cx.globalAlpha = 0.55; cx.fill(); cx.globalAlpha = 1;
+    cx.setLineDash(on ? [] : [4, 4]); cx.strokeStyle = css("--obst"); cx.lineWidth = 2; cx.stroke(); cx.setLineDash([]);
+  });
+  // track coloured by state
+  if (document.getElementById("trail").checked) {
+    cx.lineWidth = 3;
+    for (let i = 1; i <= idx; i++) { cx.strokeStyle = stCol(F[i][4]); cx.beginPath(); cx.moveTo(X(F[i - 1][1]), Y(F[i - 1][2])); cx.lineTo(X(F[i][1]), Y(F[i][2])); cx.stroke(); }
+  }
+  // poses every 2 s up to now (shows the shape of the K-turn)
+  if (document.getElementById("ghost").checked) {
+    cx.strokeStyle = css("--muted"); cx.lineWidth = 1;
+    for (let i = 0; i < idx; i += 10) { const g = F[i]; cx.save(); cx.translate(X(g[1]), Y(g[2])); cx.rotate(-g[3] * Math.PI / 180); cx.strokeRect(-0.17 * view.s, -0.13 * view.s, 0.34 * view.s, 0.26 * view.s); cx.beginPath(); cx.moveTo(0.17 * view.s, 0); cx.lineTo(0.27 * view.s, 0); cx.stroke(); cx.restore(); }
+  }
+  // LiDAR
+  const th = f[3] * Math.PI / 180;
+  if (document.getElementById("scan").checked && D.scans[idx]) {
+    cx.fillStyle = css("--scan");
+    D.scans[idx].forEach((cm, i) => { if (!cm) return; const a = th - (i * 4 + 2) * Math.PI / 180, r = cm / 100; cx.fillRect(X(f[1] + r * Math.cos(a)) - 2, Y(f[2] + r * Math.sin(a)) - 2, 4, 4); });
+  }
+  // rover
+  cx.save(); cx.translate(X(f[1]), Y(f[2])); cx.rotate(-th);
+  const L = 0.17 * view.s, W = 0.13 * view.s;
+  cx.fillStyle = f[11] ? css("--obst") : stCol(f[4]); cx.strokeStyle = css("--rover"); cx.lineWidth = 2;
+  cx.fillRect(-L, -W, 2 * L, 2 * W); cx.strokeRect(-L, -W, 2 * L, 2 * W);
+  cx.beginPath(); cx.moveTo(L + 0.12 * view.s, 0); cx.lineTo(L, -W * 0.6); cx.lineTo(L, W * 0.6); cx.closePath(); cx.fillStyle = css("--rover"); cx.fill();
+  cx.restore();
+  // scale bar
+  cx.fillStyle = css("--muted"); cx.fillRect(16, cv.clientHeight - 20, view.s * 5, 2); cx.fillText("5 m", 16, cv.clientHeight - 26);
+  panel(f); chart();
+}
+const pct = v => Math.max(-1, Math.min(1, v / 0.5));
+function setBar(id, v) { const e = document.getElementById(id), p = pct(v) * 50; e.style.left = (p >= 0 ? 50 : 50 + p) + "%"; e.style.width = Math.abs(p) + "%"; }
+let lastEv = -1;
+function panel(f) {
+  document.getElementById("kt").textContent = f[0].toFixed(1) + " s";
+  document.getElementById("ks").textContent = ST[f[4]] + " · leg " + f[5] + (f[11] ? " · TOUCHING" : "");
+  document.getElementById("ke").textContent = f[12].toFixed(1) + "°";
+  setBar("bcl", f[6]); setBar("bcr", f[7]); setBar("bol", f[8]); setBar("bor", f[9]);
+  document.getElementById("km").textContent = D.msgs[f[10]] || "";
+  let k = -1; for (let i = 0; i < D.events.length; i++) { if (D.events[i][0] <= f[0]) k = i; else break; }
+  if (k !== lastEv) {
+    lastEv = k; const ev = document.getElementById("ev");
+    [...ev.children].forEach((d, i) => d.classList.toggle("now", i === k));
+    if (k >= 0 && ev.children[k]) ev.children[k].scrollIntoView({ block: "nearest" });
+  }
+}
+// events list
+(() => {
+  const ev = document.getElementById("ev");
+  D.events.forEach(e => {
+    const d = document.createElement("div"); d.textContent = e[0].toFixed(1).padStart(6) + "  " + e[1];
+    if (/BUMP/.test(e[1])) d.className = "bump";
+    d.onclick = () => { let i = 0; while (i < N - 1 && F[i][0] < e[0]) i++; idx = i; tl.value = i; draw(); };
+    ev.appendChild(d);
+  });
+})();
+// controls
+let lastT = 0;
+function tick(ts) {
+  if (playing) {
+    const dt = lastT ? (ts - lastT) / 1000 : 0, sp = +document.getElementById("spd").value;
+    const tgt = F[idx][0] + dt * sp; while (idx < N - 1 && F[idx + 1][0] <= tgt) idx++;
+    tl.value = idx; draw(); if (idx >= N - 1) toggle(false);
+  }
+  lastT = ts; requestAnimationFrame(tick);
+}
+function toggle(p) { playing = p === undefined ? !playing : p; document.getElementById("play").textContent = playing ? "❚❚ Pause" : "▶ Play"; if (playing && idx >= N - 1) idx = 0; }
+document.getElementById("play").onclick = () => toggle();
+document.getElementById("fit").onclick = () => { document.getElementById("follow").checked = false; fit(false); draw(); };
+document.getElementById("fitall").onclick = () => { document.getElementById("follow").checked = false; fit(true); draw(); };
+document.getElementById("ghost").onchange = draw;
+tl.oninput = () => { idx = +tl.value; draw(); };
+["scan", "trail"].forEach(id => document.getElementById(id).onchange = draw);
+document.getElementById("follow").onchange = e => { if (e.target.checked) view.s = Math.max(view.s, 70); draw(); };
+cv.addEventListener("wheel", e => { e.preventDefault(); const k = e.deltaY < 0 ? 1.15 : 1 / 1.15, r = cv.getBoundingClientRect(), mx = e.clientX - r.left, my = e.clientY - r.top; view.ox = mx - (mx - view.ox) * k; view.oy = my - (my - view.oy) * k; view.s *= k; draw(); }, { passive: false });
+let drag = null;
+cv.addEventListener("pointerdown", e => { drag = [e.clientX, e.clientY]; cv.style.cursor = "grabbing"; });
+window.addEventListener("pointerup", () => { drag = null; cv.style.cursor = "grab"; });
+window.addEventListener("pointermove", e => { if (!drag) return; view.ox += e.clientX - drag[0]; view.oy += e.clientY - drag[1]; drag = [e.clientX, e.clientY]; document.getElementById("follow").checked = false; draw(); });
+window.addEventListener("keydown", e => { if (e.code === "Space") { e.preventDefault(); toggle(); } if (e.code === "ArrowRight") { idx = Math.min(N - 1, idx + 5); tl.value = idx; draw(); } if (e.code === "ArrowLeft") { idx = Math.max(0, idx - 5); tl.value = idx; draw(); } });
+window.addEventListener("resize", () => { resize(); draw(); });
+resize(); fit(false); draw(); requestAnimationFrame(tick);
+</script>
+</body>
+</html>

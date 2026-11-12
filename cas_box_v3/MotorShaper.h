@@ -47,6 +47,11 @@ public:
   float boostMax = 0.05f;
   bool vComp = false;       // battery: only measured (route effort), the command is NOT scaled
   float vRef = 11.6f;
+  // 12.11.: wheelRamp = true (set every loop pass from RouteFollow::wheelRamp(), the K-turn): each WHEEL ramps
+  // linearly at wheelRate per second to its target. The speed / turn ramps (2 s S-curve / 0.5 per s) would make the
+  // wheels opposite for most of every piece (= a pivot = no turn on rover 7); per wheel the curve shape is kept.
+  bool wheelRamp = false;
+  float wheelRate = 0.8f;
 
   void setPitch(float) {}                       // slope factor removed (kept for the interface)
   float slopePitch() const { return 0; }
@@ -67,6 +72,16 @@ public:
     float dt = _tMs ? (now - _tMs) / 1000.0f : 0.0f;
     _tMs = now;
     if (dt > 0.1f) dt = 0.1f;
+    if (wheelRamp && !hard) {
+      const float st = wheelRate * dt;
+      _wl += constrain(constrain(l, -0.5f, 0.5f) - _wl, -st, st);
+      _wr += constrain(constrain(r, -0.5f, 0.5f) - _wr, -st, st);
+      _v = 0.5f * (_wl + _wr); _w = 0.5f * (_wr - _wl);
+      _rFrom = _rTo = _v; _rT = _rDur = 0;                       // the speed ramp goes on from here afterwards
+      l = fabsf(_wl) < zero ? 0 : _wl;
+      r = fabsf(_wr) < zero ? 0 : _wr;
+      return;
+    }
     float vT = 0.5f * (l + r), wT = 0.5f * (r - l);
     const bool pivot = (l > 0 && r < 0) || (l < 0 && r > 0);
     if (vT > 0 && !pivot && boost > 0) vT += fminf(boost, boostMax);
@@ -102,6 +117,7 @@ public:
 
     l = constrain(_v - _w, -0.5f, 0.5f);
     r = constrain(_v + _w, -0.5f, 0.5f);
+    _wl = l; _wr = r;
     if (fabsf(l) < zero) l = 0;
     if (fabsf(r) < zero) r = 0;
   }
@@ -111,7 +127,7 @@ public:
   bool kicking() const { return false; }
 
 private:
-  float _v = 0, _w = 0;
+  float _v = 0, _w = 0, _wl = 0, _wr = 0;
   float _rFrom = 0, _rTo = 0, _rT = 0, _rDur = 0;   // current speed ramp
   uint32_t _tMs = 0;
   float _vb = 0;
