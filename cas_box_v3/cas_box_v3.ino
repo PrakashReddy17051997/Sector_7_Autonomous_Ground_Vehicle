@@ -141,7 +141,7 @@ char t90Msg[64] = "";
 // 51 %): the button first rolls straight at TURN90_ROLL_CMD (back if the rear is free, else forward) for
 // TURN90_ROLL_MS and then pivots at 0.5 WITHOUT stopping. No response for 2 s -> rolls again the other way (3 tries).
 const float TURN90_ROLL_CMD = 0.30f;
-const uint32_t TURN90_ROLL_MS = 1200;
+const uint32_t TURN90_ROLL_MS = 2500;   // 13.11.: was 1200 - reach the full 0.3 first (log_037 M15)
 struct Turn90 {
   bool on = false; int8_t dir = 1; float prog = 0, prevYaw = 0, rate = 0, respProg = 0;
   uint32_t t0 = 0, respMs = 0, lastMs = 0;
@@ -193,7 +193,7 @@ bool turn90Step(float padL, float padR, uint32_t padAge, float& l, float& r) {
   if (t90.prog - t90.respProg >= 1.0f) { t90.respProg = t90.prog; t90.respMs = now; }
   if (t90.rolling) {                                      // straight roll, then into the pivot without a stop
     if (now - t90.rollMs >= TURN90_ROLL_MS || !t90Free(t90.rollDir < 0)) {
-      t90.carry = t90Free(t90.rollDir < 0);                 // still free: keep rolling INTO the pivot (fading)
+      t90.carry = false;   // 13.11.: pivot asked at once, the MotorShaper fades the rolling speed (= log_037 M15)
       t90.rolling = false; t90.tries++; t90.respMs = t90.rollEndMs = now; t90.respProg = t90.prog;
     } else {
       l = r = t90.rollDir * TURN90_ROLL_CMD;

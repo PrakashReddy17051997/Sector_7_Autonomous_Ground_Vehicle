@@ -243,9 +243,10 @@ public:
   uint32_t kSegMs = 5000;             // ... or this long
   bool rollStart = true;
   float rollCmd = 0.30f;              // rolling speed before the pivot
-  float rollMaxM = 0.30f;             // roll at most this far per try (it pivots as soon as it moves at rollGoV)
-  float rollGoV = 0.20f;              // ... or once the real wheel speed reaches this
-  uint16_t rollCarryMs = 1200;        // the pivot keeps the rolling speed in its command, fading to 0 over this
+  float rollMaxM = 0.50f;             // roll at most this far per try (it pivots as soon as it moves at rollGoV)
+  float rollGoV = 0.28f;              // ... or once the real wheel speed reaches this
+  uint16_t rollCarryMs = 0;   // 13.11.: 0 = pivot asked at once, the MotorShaper fades the speed (= log_037 M15)
+  // was 1200:        // the pivot keeps the rolling speed in its command, fading to 0 over this
   float _rollV = 0;                   // signed rolling speed carried into the pivot (0 = pivot from rest)
   float climbPow = 0.40f;             // stuck: push straight at this first (no steering), climbMs long
   uint32_t climbMs = 3000;            // (the 2 s S-curve speed ramp needs ~2 s to reach climbPow)

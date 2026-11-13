@@ -63,11 +63,11 @@ static const LmkPhase kLeg6[] = {
   {LandmarkLeg::HOLD, 0, 1.0f, 7.0f, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0},  // no usable line: heading / taught path
   {LandmarkLeg::SIDE, 90, 7.0f, 11.0f, 2.75f, 1.79f, 3.72f, 10, 1.5f, 20, 8, 10, 1.0f, 0.05f, 0, 0, 0, 0, -4.4f},  // left line 2.75 m (52 scans)
   {LandmarkLeg::HOLD, 0, 11.0f, 15.0f, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0},  // no usable line: heading / taught path
-  {LandmarkLeg::SIDE, 90, 15.0f, 23.2f, 2.43f, 1.58f, 3.28f, 10, 1.5f, 20, 8, 10, 1.0f, 0.05f, 0, 0, 0, 0, -11.6f},  // left line 2.43 m (281 scans)
+  {LandmarkLeg::SIDE, 90, 15.0f, 23.2f, 0.80f, 0.30f, 3.30f, 10, 1.5f, 20, 15, 10, 1.0f, 0.05f, 0, 0, 0, 0, -11.6f},  // 13.11.: ramp M51-M55 - left wall at 0.8 m (taught 2.43 m = at the right column)
 };
 // leg 7 (M55-M57), taught 2.8 m, ref -93.6 deg
 static const LmkPhase kLeg7[] = {
-  {LandmarkLeg::SIDE, 90, 0.0f, 2.8f, 2.47f, 1.60f, 3.33f, 10, 1.5f, 20, 8, 10, 1.0f, 0.05f, 0, 0, 0, 0, 0.3f},  // left line 2.47 m (120 scans)
+  {LandmarkLeg::SIDE, 90, 0.0f, 2.8f, 0.80f, 0.30f, 3.30f, 10, 1.5f, 20, 15, 10, 1.0f, 0.05f, 0, 0, 0, 0, 0.3f},  // 13.11.: ramp end M55-M57 - left wall at 0.8 m (taught 2.47 m)
 };
 // leg 8 (M57-M60), taught 8.0 m, ref -99.2 deg
 static const LmkPhase kLeg8[] = {

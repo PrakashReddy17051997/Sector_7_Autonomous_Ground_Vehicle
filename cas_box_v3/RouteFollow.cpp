@@ -291,7 +291,7 @@ void RouteFollow::_control(const Sensors& s) {
   // ~10 deg and the next pivot started at once - 14 restarts for one 83 deg turn in the sim)
   if (!_pivoting && (ae >= pivotDeg || (!_tgtFwd && ae > turnDoneDeg)) && (ae >= pivotDeg + 20.0f || now - _pivotEndMs > 600)) {
     _pivoting = true; _pivotMs = now; _tapDir = dir; _hc = 0; _pivBoost = 0;
-    if (turnTactics) { _netM = 0; _kDir = 0; _kYaw0 = s.yawNowDeg(); _tacStart(kTurn ? TK_PIVOT : ((rollStart && fabsf(_outV) < 0.12f) ? TK_ROLL : TK_PIVOT), s, now, true); }
+    if (turnTactics) { _netM = 0; _kDir = 0; _kYaw0 = s.yawNowDeg(); _tacStart((rollStart && fabsf(_outV) < 0.12f) ? TK_ROLL : TK_PIVOT, s, now, true); }   // 13.11.: standing -> roll first (log_037 M15)
   }
   if (_pivoting) {
     const float coast = fminf(14.0f, fabsf(_rate) * pivotCoastS);  // still turns this much after the release (Kethan: 14 deg at 0.35)
@@ -1005,7 +1005,7 @@ void RouteFollow::_tactic(const Sensors& s, float dt, uint32_t now) {
       // straight into the pivot - no REST in between (that is the point: the turn starts while rolling)
       const bool ok = _shiftBack ? (_rearFree(s) && -_netM < backShiftMaxM) : fwdOk;
       if (dt > 0 && dt < 0.1f) _shiftM += fabsf(_outV) * dt;
-      if (!ok || fabsf(_outV) >= rollGoV || _shiftM >= rollMaxM || now - _tkMs > 1800) {
+      if (!ok || fabsf(_outV) >= rollGoV || _shiftM >= rollMaxM || now - _tkMs > 3000) {   // 13.11.: was 1.8 s (S-curve needs 2 s)
         const uint8_t keepNext = _tkNext;
         const float carry = ok ? (_shiftBack ? -rollCmd : rollCmd) : 0.0f;   // blocked: no rolling on into it
         _tacStart(TK_PIVOT, s, now, false);
