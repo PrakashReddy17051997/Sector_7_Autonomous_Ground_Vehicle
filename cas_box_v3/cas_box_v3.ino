@@ -279,7 +279,9 @@ void setup() {
   if (BLOCK_I_LEG) mission.route.setLandmarkLeg(BLOCK_I_LEG - 1, kBlockI, LMK_COUNT(kBlockI));
   // 11.11. (log_032): legs 6-15 (ramp M51-M57 and the open area M57-M72) on landmark lines, tables from log_027
   if (LMK_LEGS_6_15)
-    for (const LmkLegReg& g : kLmkLegs) mission.route.setLandmarkLeg(g.leg - 1, g.ph, g.n, g.lenM);
+     for (const LmkLegReg& g : kLmkLegs)
+      if (g.leg <= 7 || g.leg >= 10)   // 13.11. (log_038): legs 8-9 on the taught path
+        mission.route.setLandmarkLeg(g.leg - 1, g.ph, g.n, g.lenM);
   mission.needHeartbeat = !MISSION_QUIET;   // phone off -> the mission must run without the page heartbeat
   radio.quietOnMission = MISSION_QUIET;
   radio.onChange = [](bool q) { mission.needHeartbeat = !q; };
