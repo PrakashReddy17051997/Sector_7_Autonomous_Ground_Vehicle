@@ -35,6 +35,7 @@ public:
   bool imuOk() const { return _imuReady && _imu.headingReady(); }
   const ImuManager& imu() const { return _imu; }            // v3: double tap + IMU recording
   bool gpsUtc(char* buf, size_t n) { return _gps.utc(buf, n); }   // v3: GPS clock (UTC), false if unknown
+  bool gpsSod(long& sod, uint32_t& ageMs) { return _gps.utcSod(sod, ageMs); }   // 18.11.: countdown clock
   uint32_t imuBadSamples() const { return _imu.badSamples(); }
   float yawDeg() const { return _yaw; }      // ISO 8855: + = turning left, 0 = first valid IMU reading
   // live yaw (IMU read at 50 Hz), not the 4 Hz snapshot: for the heading controller only - the

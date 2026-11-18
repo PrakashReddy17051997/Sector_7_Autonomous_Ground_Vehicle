@@ -24,3 +24,10 @@ bool GpsManager::utc(char* buf, size_t n) {
            (unsigned)_gps.date.day(), (unsigned)_gps.time.hour(), (unsigned)_gps.time.minute(), (unsigned)_gps.time.second());
   return true;
 }
+
+bool GpsManager::utcSod(long& sod, uint32_t& ageMs) {
+  if (!_gps.time.isValid() || !_gps.date.isValid() || _gps.date.year() < 2020) return false;
+  ageMs = _gps.time.age() + 10u * _gps.time.centisecond();   // age of the NMEA sentence + its hundredths
+  sod = (long)_gps.time.hour() * 3600L + (long)_gps.time.minute() * 60L + (long)_gps.time.second();
+  return ageMs < 5000;
+}

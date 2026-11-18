@@ -50,6 +50,7 @@ $('msS').onclick=()=>fetch('/mission/stop',{cache:'no-store'}).then(st);
 setInterval(()=>{if(running&&!document.hidden)fetch('/mission/alive',{cache:'no-store'}).catch(()=>{});},250);
 setInterval(st,1000);st();
 const rm=document.createElement('script');rm.src='/routemap.js';document.body.appendChild(rm);  // Route map card
+const cd=document.createElement('script');cd.src='/countdown.js';document.body.appendChild(cd);  // 18.11.: Countdown card
 })();)rawjs";
 
 // ---------------------------------------------------------------------------------------------

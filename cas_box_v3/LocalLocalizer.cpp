@@ -403,13 +403,16 @@ bool LocalLocalizer::alignSearch(const uint16_t* scanCm, uint8_t leg, float maxO
   tmp._leg = leg;
   // coarse: every 4 deg, position grid 0.2 m
   const int nh = (int)(maxOffM / 0.2f + 0.5f);
+  // 18.11. (random start pose): the closer-is-likelier penalty is scaled to the search range, else a rover put down
+  // 1.5 m off is always matched at the nearest grid points
+  const float pen = 0.3f / fmaxf(1.0f, maxOffM * maxOffM);
   float sc[90];
   float bx[90], by[90];
   for (int t = 0; t < 90; t++) {
     const float th = (t * 4 - 180) * kDeg;
     sc[t] = -9; bx[t] = by[t] = 0;
     for (int ix = -nh; ix <= nh; ix++) for (int iy = -nh; iy <= nh; iy++) {
-      const float v = tmp.scoreAt(px, py, n, ix * 0.2f, iy * 0.2f, th) - 0.3f * (ix * ix + iy * iy) * 0.04f;
+      const float v = tmp.scoreAt(px, py, n, ix * 0.2f, iy * 0.2f, th) - pen * (ix * ix + iy * iy) * 0.04f;
       if (v > sc[t]) { sc[t] = v; bx[t] = ix * 0.2f; by[t] = iy * 0.2f; }
     }
   }

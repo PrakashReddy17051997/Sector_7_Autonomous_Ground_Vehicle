@@ -22,6 +22,8 @@ public:
   // v3: GPS clock "YYYY-MM-DD hh:mm:ss UTC" (the module gives the time as soon as it tracks one
   // satellite, before a position fix). false = no valid time yet.
   bool utc(char* buf, size_t n);
+  // 18.11.: UTC seconds of the day (0..86399) and how old that reading is (ms). false = no valid time.
+  bool utcSod(long& sod, uint32_t& ageMs);
 
 private:
   TinyGPSPlus _gps;

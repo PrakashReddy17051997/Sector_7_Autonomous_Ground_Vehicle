@@ -70,6 +70,7 @@
 #include "RoverLink.h"
 #include "Sensors.h"
 #include "DisplayManager.h"
+#include "Countdown.h"       // 18.11.: countdown start (display, web card, double tap, u-blox clock)
 #include "DriveLog.h"
 #include "SafetyGuard.h"
 #include "GpsNav.h"
@@ -123,6 +124,7 @@ WebHMI hmi;           // web server + page
 RoverLink rover;      // connection to the rover
 Sensors sensors;      // all box sensors
 DisplayManager disp;  // small OLED on the box
+Countdown countdown;  // 18.11.
 DriveLog logger;      // drive recording to flash (web card "Drive log")
 SafetyGuard guard;    // emergency stop layer, thresholds in guard.cfg
 GpsNav nav;           // autonomous GPS waypoint mode (web card "Autonomous (GPS)")
@@ -155,12 +157,6 @@ static bool t90Free(bool back) {   // LiDAR (4 deg bins, 0 = ahead) + ultrasonic
   for (int8_t k = -7; k <= 7; k++) { const uint16_t cm = sensors.lidarCm((uint8_t)((k + 90) % 90)); if (cm > 25 && cm < 60) return false; }
   return true;
 }
-static void t90Roll(uint32_t now) {   // next roll: back first, then alternating; none possible -> pivot only
-  int8_t want = t90.tries == 0 ? -1 : -t90.rollDir;
-  if (!t90Free(want < 0)) want = -want;
-  if (!t90Free(want < 0)) { t90.rolling = false; return; }
-  t90.rolling = true; t90.rollDir = want; t90.rollMs = now;
-}
 static float wrap180f(float a) { a = fmodf(a + 180.0f, 360.0f); if (a < 0) a += 360.0f; return a - 180.0f; }
 void turn90Stop(const char* why) { t90.on = false; snprintf(t90Msg, sizeof(t90Msg), "%s (%.0f deg)", why, t90.prog); Serial.printf("[turn90] %s\n", t90Msg); }
 // returns true while it drives the wheels
@@ -172,14 +168,13 @@ bool turn90Step(float padL, float padR, uint32_t padAge, float& l, float& r) {
     else if (!sensors.imuOk()) { snprintf(t90Msg, sizeof(t90Msg), "no IMU - no turn"); }
     else {
       t90 = Turn90(); t90.on = true; t90.dir = t90Req; t90.t0 = t90.respMs = t90.lastMs = now; t90.prevYaw = sensors.yawNowDeg();
-      t90Roll(now);
-      snprintf(t90Msg, sizeof(t90Msg), "%s 90: %s", t90.dir > 0 ? "Left" : "Right", t90.rolling ? "rolling start" : "starting");
+      snprintf(t90Msg, sizeof(t90Msg), "%s 90: curves", t90.dir > 0 ? "Left" : "Right");
     }
   }
   if (!t90.on) return false;
   if (padAge <= PAD_TIMEOUT_MS && (padL != 0 || padR != 0)) { turn90Stop("drive key - cancelled"); return false; }
   if (!sensors.imuOk()) { turn90Stop("IMU invalid - stopped"); return false; }
-  if (now - t90.t0 > 20000) { turn90Stop("20 s - stopped"); return false; }
+  if (now - t90.t0 > 60000) { turn90Stop("60 s - stopped"); return false; }   // 18.11.: curves need ~40 s
   const float y = sensors.yawNowDeg();
   const float dy = wrap180f(y - t90.prevYaw);
   const float dt = (now - t90.lastMs) / 1000.0f;
@@ -191,26 +186,17 @@ bool turn90Step(float padL, float padR, uint32_t padAge, float& l, float& r) {
   const float coast = fminf(TURN90_STOP_EARLY_MAX, fabsf(t90.rate) * 0.45f);
   if (t90.prog >= 90.0f - coast) { turn90Stop("done"); return false; }
   if (t90.prog - t90.respProg >= 1.0f) { t90.respProg = t90.prog; t90.respMs = now; }
-  if (t90.rolling) {                                      // straight roll, then into the pivot without a stop
-    if (now - t90.rollMs >= TURN90_ROLL_MS || !t90Free(t90.rollDir < 0)) {
-      t90.carry = false;   // 13.11.: pivot asked at once, the MotorShaper fades the rolling speed (= log_037 M15)
-      t90.rolling = false; t90.tries++; t90.respMs = t90.rollEndMs = now; t90.respProg = t90.prog;
-    } else {
-      l = r = t90.rollDir * TURN90_ROLL_CMD;
-      snprintf(t90Msg, sizeof(t90Msg), "%s 90: rolling %s (try %u)", t90.dir > 0 ? "Left" : "Right", t90.rollDir < 0 ? "back" : "fwd", t90.tries + 1);
-      return true;
-    }
-  }
-  if (now - t90.respMs > 2000) {
-    if (t90.tries < 3) { t90Roll(now); if (t90.rolling) { t90.respMs = now; l = r = t90.rollDir * TURN90_ROLL_CMD; return true; } }
-    turn90Stop("no turn response - stopped"); return false;
-  }
-  float cv = 0;                                           // rolling speed carried into the pivot, fading over 1.2 s
-  if (t90.carry && now - t90.rollEndMs < 1200 && t90Free(t90.rollDir < 0))
-    cv = t90.rollDir * TURN90_ROLL_CMD * (1.0f - (now - t90.rollEndMs) / 1200.0f);
-  else t90.carry = false;
-  l = cv - t90.dir * PIVOT_CMD; r = cv + t90.dir * PIVOT_CMD;
-  snprintf(t90Msg, sizeof(t90Msg), "%s 90: %.0f / 90 deg", t90.dir > 0 ? "Left" : "Right", t90.prog);
+  // 18.11. (course rule: no turning on the spot): a manual K-turn - forward curve (inner wheel slow), soft stop,
+  // backward curve (the other wheel slow, the body keeps rotating the same way), soft stop, ... until 90 deg.
+  // Each wheel ramps on its own (shaper.wheelRamp while t90.on), so the wheels are never opposite.
+  const uint32_t ph = (now - t90.t0) % 6000;              // 0-2 s fwd, 2-3 s stop, 3-5 s back, 5-6 s stop
+  const bool fwd = ph < 2000, back = ph >= 3000 && ph < 5000;
+  const float o = PIVOT_CMD, in = 0.05f;
+  if (fwd && t90Free(false)) { if (t90.dir > 0) { l = in; r = o; } else { l = o; r = in; } }
+  else if (back && t90Free(true)) { if (t90.dir > 0) { l = -o; r = -in; } else { l = -in; r = -o; } }
+  else l = r = 0;
+  snprintf(t90Msg, sizeof(t90Msg), "%s 90: %.0f / 90 deg (%s)", t90.dir > 0 ? "Left" : "Right", t90.prog,
+           fwd ? "forward curve" : (back ? "backward curve" : "stop"));
   return true;
 }
 bool oledReady = false;
@@ -230,7 +216,11 @@ void updateOled() {
   String ip = WiFi.softAPIP().toString();
   String r = rover.connected() ? "Rover " + String(rover.voltage(), 1) + "V" : "Rover: search";
   if (radio.quiet()) { disp.show(boxSsid, "MISSION: phone off", "2x tap = Wi-Fi on"); return; }
-  disp.show(boxSsid, ip.c_str(), r.c_str());
+  // 18.11. (course rule): line 1 = countdown state; ACTIVE -> seconds to the start on line 2
+  char c1[24], c2[24];
+  countdown.line(c1, sizeof(c1));
+  if (countdown.active()) { countdown.line2(c2, sizeof(c2)); disp.show(c1, c2, boxSsid); return; }
+  disp.show(c1, ip.c_str(), r.c_str());
 }
 
 void setup() {
@@ -271,6 +261,7 @@ void setup() {
   nav.begin(hmi.server());     // loads the B->H route from log_003
   wall.begin(hmi.server());
   mission.begin(hmi.server());
+  countdown.begin(hmi.server());   // 18.11.
   // v3 settings
   mission.route.alignStart = START_ALIGN;
   mission.route.trim = ROVER_TRIM_START;
@@ -279,8 +270,8 @@ void setup() {
   if (BLOCK_I_LEG) mission.route.setLandmarkLeg(BLOCK_I_LEG - 1, kBlockI, LMK_COUNT(kBlockI));
   // 11.11. (log_032): legs 6-15 (ramp M51-M57 and the open area M57-M72) on landmark lines, tables from log_027
   if (LMK_LEGS_6_15)
-     for (const LmkLegReg& g : kLmkLegs)
-      if (g.leg <= 7 || g.leg >= 10)   // 13.11. (log_038): legs 8-9 on the taught path
+    for (const LmkLegReg& g : kLmkLegs)
+      if (g.leg <= 7 || g.leg >= 10)   // 13.11. (log_038): legs 8-9 on the taught path - their wall rows steered 50-78 deg off
         mission.route.setLandmarkLeg(g.leg - 1, g.ph, g.n, g.lenM);
   mission.needHeartbeat = !MISSION_QUIET;   // phone off -> the mission must run without the page heartbeat
   radio.quietOnMission = MISSION_QUIET;
@@ -328,9 +319,13 @@ void loop() {
   if (age > PAD_TIMEOUT_MS) l = r = 0;  // key released, page closed or phone gone
 
   // 11.11.: pad turn keys (left/right on the spot) pivot at PIVOT_CMD - the slider's 0.30 does not turn rover 7
-  if (l * r < 0) { const float d = r > 0 ? 1.0f : -1.0f; l = -d * PIVOT_CMD; r = d * PIVOT_CMD; }
+  // 18.11. (course rule: no turning on the spot): the turn keys make a forward curve, inner wheel slow
+  const bool padCurve = l * r < 0;
+  if (padCurve) { const float d = r > 0 ? 1.0f : -1.0f; l = d > 0 ? 0.05f : PIVOT_CMD; r = d > 0 ? PIVOT_CMD : 0.05f; }
 
   // Full-auto mission (heartbeat from the page) - otherwise manual driving from the pad.
+  // 18.11.: countdown at 0 s -> whole route (the start pose is found by the start alignment)
+  if (countdown.poll(sensors) && !mission.active()) mission.requestRoute(countdown.speed);
   mission.pollRequests(sensors, wall, nav);
   if (mission.active()) { if (t90.on) turn90Stop("mission started"); mission.steer(sensors, wall, nav, padL, padR, age, l, r); }
   else turn90Step(padL, padR, age, l, r);   // Left / Right 90 buttons (manual only)
@@ -353,7 +348,7 @@ void loop() {
   // v3 (log_030): turn tactics need full turn power quickly (Arjun: pivots worked 36 % with full power at once,
   // 13 % with a slow ramp) - 0 -> 0.50 in 0.25 s while a tactic turn runs; the stop ramp stays gentle (wDown)
   shaper.wUp = 0.50f;   // 11.11.: every pivot 0 -> 0.5 in 1 s (Kethan's 1 s ramp, rover 7 needs 0.5)
-  shaper.wheelRamp = mission.active() && mission.route.wheelRamp();   // 12.11.: K-turn pieces keep their curve
+  shaper.wheelRamp = (mission.active() && mission.route.wheelRamp()) || t90.on || (padCurve && !mission.active());   // 18.11.: manual curves too (never opposite wheels)   // 12.11.: K-turn pieces keep their curve
   shaper.apply(l, r, safetyReason != SafetyGuard::OK);   // gradual; a guard stop (obstacle / tilt) drops the speed at once
 
   rover.setDrive(l, r);                 // every loop pass, after guard and shaper
@@ -463,7 +458,7 @@ void loop() {
     hmi.showValue("route", String(mission.route.legIndex() + 1) + " " + mission.route.msg() + " eff " +
                            String(mission.route.effortFrac() * 100.0f, 0) + "%");
   }
-  if (now - lastOled >= 1000) {
+  if (now - lastOled >= (countdown.active() ? 250u : 1000u)) {   // 18.11.: seconds on the display stay current
     lastOled = now;
     updateOled();
   }

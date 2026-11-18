@@ -237,6 +237,10 @@ public:
   // pieces alternate so the rover stays near where it started (net forward / backward limits as for the shifts).
   // Used for the start turn, every corner pivot and the obstacle detour turns. kTurn = false: the old tactics.
   bool kTurn = true;
+  // 18.11. (course rule 17.11., gearbox protection): NO turning on the spot - every direction change is a curve while
+  // driving. curveOnly = true: a turn that needs more than the rolling PD goes straight to the K-turn curves (both
+  // wheels the same direction); pivot / swing / roll+pivot / shift are never used.
+  bool curveOnly = true;
   float kOuter = 0.50f;               // outer wheel (the fast one), forward or backward
   float kInner = 0.05f;               // inner wheel, same direction (>= 0: never opposite = never a pivot)
   float kSegM = 0.40f;                // one piece at most this far (odometry, 1 m/s per unit)
@@ -285,7 +289,7 @@ public:
   float avMoveM = 0.10f;          // obstacle moved more than this between scans while we stand: it is moving
   uint32_t staticMs = 750;        // ... not moved for this long: static -> detour now
   float avMinScore = 0.6f;        // early (1.5 m) detection only with a LiDAR match at least this good
-  bool firmStop() const { return active() && ((_state == AVOID && _avPhase < 10) || _state == BACKUP); }   // -> MotorShaper.firm
+  bool firmStop() const { return active() && _state == AVOID && _avPhase < 10; }   // 18.11.: emergency only (obstacle stop), back-up ramps softly   // -> MotorShaper.firm
   // SMOOTH REROUTE (v4b, 11.11.): a static thing seen EARLY (new points up to rrLookM ahead on the locked path,
   // 2 scans) is passed on a planned smooth curve without stopping:
   //   lateral offset y(s) along the line (dead-reckoned frame of the moment it was seen):
@@ -314,7 +318,8 @@ public:
 
   float _roll0 = 0;                   // (12.11.) roll at the leg start: side lines are checked against the ROLL
   bool alignStart = true;
-  float alignMaxOffM = 0.6f;          // rover put down within this of the taught start point
+  float alignMaxOffM = 2.0f;          // rover put down within this of the taught start point (18.11.: random start
+                                      // pose in front of the post office - was 0.6)
   float alignDeg() const { return _alignDeg; }       // how far the rover was turned off at the start
   float alignScore() const { return _alignSc; }
   float alignSecond() const { return _alignSec; }

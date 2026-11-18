@@ -291,7 +291,7 @@ void RouteFollow::_control(const Sensors& s) {
   // ~10 deg and the next pivot started at once - 14 restarts for one 83 deg turn in the sim)
   if (!_pivoting && (ae >= pivotDeg || (!_tgtFwd && ae > turnDoneDeg)) && (ae >= pivotDeg + 20.0f || now - _pivotEndMs > 600)) {
     _pivoting = true; _pivotMs = now; _tapDir = dir; _hc = 0; _pivBoost = 0;
-    if (turnTactics) { _netM = 0; _kDir = 0; _kYaw0 = s.yawNowDeg(); _tacStart((rollStart && fabsf(_outV) < 0.12f) ? TK_ROLL : TK_PIVOT, s, now, true); }   // 13.11.: standing -> roll first (log_037 M15)
+    if (turnTactics) { _netM = 0; _kDir = 0; _kYaw0 = s.yawNowDeg(); _tacStart(curveOnly ? TK_KTURN : ((rollStart && fabsf(_outV) < 0.12f) ? TK_ROLL : TK_PIVOT), s, now, true); }   // 18.11.: curveOnly -> K-turn curves only   // 13.11.: standing -> roll first (log_037 M15)
   }
   if (_pivoting) {
     const float coast = fminf(14.0f, fabsf(_rate) * pivotCoastS);  // still turns this much after the release (Kethan: 14 deg at 0.35)
@@ -315,9 +315,15 @@ void RouteFollow::_control(const Sensors& s) {
     _pivoting = false; _pivotEndMs = now; _tk = TK_NONE;
   }
 
+  // 18.11.: still rolling backward (end of a backward curve) -> first stop softly, then drive forward: a forward
+  // command with a heading correction while the wheels still run backward / turn makes them opposite for a moment
+  if (curveOnly && base > 0 && (_outV < -0.02f || (fabsf(_outW) > 0.03f && fabsf(_outW) > fabsf(_outV) + 0.01f))) { _l = _r = 0; _hc = 0; return; }   // |w| > |v| = wheels opposite
   // ---- rolling: PD heading hold (Kethan)
   // v4b: on the smooth reroute curve a bigger wheel difference (the curve is planned for it)
-  const float limit = rerouting() ? fminf(rrCorrMax, 0.8f * fabsf(base)) : fminf(corrMax, corrFrac * fabsf(base));
+  // 18.11.: curveOnly -> the correction is limited by the speed the wheels REALLY have (the S-curve speed ramp is
+  // slower than the turn ramp: from standstill the correction alone would make the wheels opposite)
+  const float vRef = curveOnly ? fminf(fabsf(base), fabsf(_outV) + 0.02f) : fabsf(base);
+  const float limit = rerouting() ? fminf(rrCorrMax, 0.8f * vRef) : fminf(corrMax, corrFrac * vRef);
   const float want = _clamp((ae > 0.5f ? hKp * e : 0.0f) - hKd * _rate, -limit, limit);
   if (dt <= 0 || dt >= 0.1f) _hc = 0;
   else _hc += _clamp(want - _hc, -corrRate * dt, corrRate * dt);
@@ -995,6 +1001,9 @@ void RouteFollow::_tactic(const Sensors& s, float dt, uint32_t now) {
         return;
       }
       // turning left (d > 0): forward = right wheel fast; backward = LEFT wheel fast backward (r - l > 0 both times)
+      // 18.11.: a new piece starts only once the last one has stopped - else the per-wheel ramps pass through
+      // OPPOSITE wheels for ~0.5 s (left still backward, right already forward = a turn on the spot)
+      if ((back && _outV > 0.02f) || (!back && _outV < -0.02f)) { _l = _r = 0; return; }
       const float o = kOuter, in = kInner;
       if (!back) { if (d > 0) { _l = in; _r = o; } else { _l = o; _r = in; } }
       else       { if (d > 0) { _l = -o; _r = -in; } else { _l = -in; _r = -o; } }
@@ -1202,7 +1211,8 @@ void RouteFollow::_avoidSmart(const Sensors& s, const Leg& L, float ry, uint32_t
     if (now - _stateMs > 60000) { pause("detour took > 60 s - help me, Resume"); return; }
   }
   // never turn on the spot with something closer than 0.22 m to the centre (the body corners sweep ~0.2 m)
-  if (_pivoting && _avPhase >= 1) {
+  // (18.11.: curveOnly - the K-turn pieces check their own room ahead / behind; no on-the-spot sweep)
+  if (_pivoting && _avPhase >= 1 && !curveOnly) {
     uint16_t mn = 999;
     for (uint8_t k = 0; k < Sensors::kLidarPoints; k++) { const uint16_t c = s.lidarCm(k); if (c >= 15 && c < mn) mn = c; }
     if (mn < 22) { pause("too close to turn - move me, Resume"); return; }
@@ -1249,13 +1259,13 @@ void RouteFollow::_avoidSmart(const Sensors& s, const Leg& L, float ry, uint32_t
       if (now - _stateMs < 3000) return;
       // 12.11. (tools/sim_v3): too close to curve out of the way (rover 7 cannot turn on the spot) -> back up
       // straight ~0.5 m (BACKUP: 2.5 s at backupCmd) and plan again from there
-      if (_avTries < 2 && _rearFree(s) && fr < 1.0f && !(L.end == END_FRONT && _eff >= 0.3f * L.effort)) {
+      if (_avTries < 5 && _rearFree(s) && fr < 1.0f && !(L.end == END_FRONT && _eff >= 0.3f * L.effort)) {   // 18.11.: was 2 (curves need more room)
         _avTries++; _state = BACKUP; _stateMs = now; _climbUntil = 0;
         strlcpy(_msg, "obstacle too close to go round - backing up", sizeof(_msg));
         Serial.println("[route] obstacle: no room to curve out -> back up and plan again");
         return;
       }
-      if (++_avTries >= 3) { pause("blocked - help me, then Resume"); return; }
+      if (++_avTries >= 7) { pause("blocked - help me, then Resume"); return; }   // 18.11.: was 3 - wait + re-plan first
       _stateMs = now;                                            // wait another 3 s, then plan again
       return;
     }
