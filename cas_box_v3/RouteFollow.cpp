@@ -26,6 +26,10 @@ static const RouteFollow::Leg kRoute[] = {
   {RouteFollow::WALL, -1, RouteFollow::END_EFFORT, 0.00f,  -183.2f, 2.55f,   6.5f, 0.75f, 0.0000000, 0.0000000, 1, 0, 0, "M66-M69 L wall: wall starts ahead"},  // 13: t 1430-1466 s, GPS 0.0 m
   {RouteFollow::HOLD,  1, RouteFollow::END_EFFORT, 0.00f,  -183.5f, 0.00f,   4.4f, 0.75f, 0.0000000, 0.0000000, 1, 0, 0, "M69-M71 heading: corner right"},  // 14: t 1466-1530 s, GPS 0.0 m
   {RouteFollow::HOLD, -1, RouteFollow::END_EFFORT, 0.00f,  -273.5f, 0.00f,   2.4f, 0.75f, 0.0000000, 0.0000000, 1, 0, 0, "M71-M72 heading: open area ahead"},  // 15: t 1535-1558 s, GPS 0.0 m
+  // 19.11.: leg 16 appended from log_048 M1-M2 (t 1847-1869 s, driven by hand after the route; tag "L wall: wall ends
+  // left"). No LiDAR map / LocalPath for it (those stay 15 legs): heading + distance only. ref and effort are DEAD
+  // RECKONED (no GPS in log_048): ~3.7 m (3.2-4.5) at route yaw ~-269 deg (-266..-275) -> check on site, tune here.
+  {RouteFollow::HOLD, -1, RouteFollow::END_EFFORT, 0.00f,  -269.0f, 0.00f,   3.7f, 0.75f, 0.0000000, 0.0000000, 1, 0, 0, "M72-M73 heading: log_048 M1-M2 (I-H)"},  // 16
 };
 
 static const uint8_t kN = sizeof(kRoute) / sizeof(kRoute[0]);
@@ -55,7 +59,7 @@ bool RouteFollow::start(const Sensors& s, const WallFollow& wf, uint8_t i, float
   bool aligned = false;
   float ax = 0, ay = 0, ath = 0;
   _alignDeg = 0; _alignSc = 0; _alignSec = 0;
-  if (alignStart && pathMode && _lp.legs() == kN) {
+  if (alignStart && pathMode && _lp.legs() <= kN && i < _lp.legs()) {   // 19.11.: leg 16 has no map
     for (uint8_t k = 0; k < Sensors::kLidarPoints; k++) _scan[k] = s.lidarCm(k);
     aligned = _lp.alignSearch(_scan, i, alignMaxOffM, ax, ay, ath, _alignSc, _alignSec);
     _alignDeg = ath * RAD_TO_DEG;
@@ -85,8 +89,8 @@ bool RouteFollow::start(const Sensors& s, const WallFollow& wf, uint8_t i, float
     Serial.printf("[route] RouteMap.h has %u legs, kRoute %u - LiDAR end match OFF (old rule). "
                   "Re-run tools/make_segments.py + make_legs.py\n", (unsigned)RouteLocalizer::mapLegs(), (unsigned)kN);
   _loc.beginLeg(i);
-  _lpOn = pathMode && _lp.legs() == kN;   // LocalPath.h from the same teaching run as kRoute
-  if (_lpOn) _lp.begin(i);                // rover at the start of leg i, pointing along it
+  _lpOn = pathMode && _lp.legs() > 0 && _lp.legs() <= kN;   // LocalPath.h from the same teaching run (19.11.: legs after its last have no map)
+  if (_lpOn && i < _lp.legs()) _lp.begin(i);   // rover at the start of leg i, pointing along it
   if (_lpOn && aligned) _lp.setPose(ax, ay, ath);   // v3: the pose the start align found
   _lpYawPrev = s.yawDeg();
   _lpEffAcc = 0;
@@ -170,7 +174,7 @@ bool RouteFollow::_pathSteer() const {
 }
 
 bool RouteFollow::pathLocked() const {
-  return _lpOn && _lp.lostN() < 8 && _lpOkMs != 0 && millis() - _lpOkMs < 3000;
+  return _lpOn && _i < _lp.legs() && _lp.lostN() < 8 && _lpOkMs != 0 && millis() - _lpOkMs < 3000;   // 19.11.: no map past its last leg
 }
 
 void RouteFollow::steer(const Sensors& s, const WallFollow& wf, float& l, float& r) {
@@ -242,6 +246,7 @@ float RouteFollow::_scanChangeCm(const Sensors& s) const {
 // Sets the target for _control: e = wanted - current heading (deg, + = left), v = forward command,
 // fwd = roll forwards (else backwards, e.g. obstacle ahead). Called from the 4 Hz _step.
 void RouteFollow::_drive(float e, float v, bool fwd) {
+  if (fwd && _state == DRIVE && !_gapDeviating) e += _wallBias;   // 19.11.: wall keep-off (log_048 leg 6)
   if (fwd && _gapOk && _state == DRIVE) _gapSteer(e, v);   // v6: curved avoidance bends the route direction
   else if (_state != DRIVE) _gapDeviating = false;
   _tgtYaw = _wrap(_stepRy + e);              // absolute target, from the snapshot heading of this step
@@ -388,7 +393,7 @@ void RouteFollow::_nextLeg(const Sensors& s, const char* how) {
   if (_loc.costNow() >= 0)
     snprintf(sc, sizeof(sc), "scan %.0f/%.0f cm%s", _loc.costNow(), _loc.base(), _loc.dip() ? " dip" : "");
   Serial.printf("[route] leg %u done (%s), effort %.1f/%.1f, %s%s, drift %.1f deg/s, trim %.3f\n", (unsigned)(_i + 1), how, _eff, L.effort, sc, warn, _drift, trim);
-  if (_lpOn && _lp.leg() == _i && _i + 1 < kN) _lp.nextLeg();   // keep the local frame on the same leg
+  if (_lpOn && _lp.leg() == _i && _i + 1 < _lp.legs()) _lp.nextLeg();   // 19.11.: _lp.legs() (leg 16 has no map)   // keep the local frame on the same leg
   _peInit = false; _noTurnEff = -99;
   snprintf(_endInfo, sizeof(_endInfo), "leg %u: %s, effort %.0f %%, %s%s", (unsigned)(_i + 1), how,
            L.effort > 0 ? 100.0f * _eff / L.effort : 0.0f, sc, warn);
@@ -421,7 +426,7 @@ void RouteFollow::_step(const Sensors& s, const WallFollow& wf) {
   const float ry = routeYaw(s);
   _stepRy = ry;
   // ---- local path localisation: every step, in every state (turns and obstacles included)
-  if (_lpOn) {
+  if (_lpOn && _i < _lp.legs()) {   // 19.11.: not on legs past the map (leg 16: its end would read "path end" at once)
     // v4: during a detour the rover is off the taught path on purpose - the scan match still works there (sim:
     // score 0.85 at 0.8 m off), but the 1 m relocation rule snapped the pose back onto the path
     _lp.relocOffM = (_state == AVOID && (_avPhase >= 1 || _avMid)) ? 1.8f : 1.0f;
@@ -651,6 +656,7 @@ void RouteFollow::_step(const Sensors& s, const WallFollow& wf) {
         // v5 (Vinay): stop 35 cm before it, then turn + go round with the side ultrasonic (see RouteFollow.h).
         // On the slope the LiDAR sees the ramp surface: no detour there (SafetyGuard ultrasonic + tilt stay on).
         _gapOk = false;                                              // v6: _obsDetect sets it for this step
+        _wallBias = 0;                                               // 19.11.: _obsDetect sets it (not on the slope)
         if (!ramp && _obsDetect(s, L, now, vCap)) return;
       } else {
       // v4b: a new thing seen EARLY (up to rrLookM, 2 scans in a row) -> smooth reroute without stopping
@@ -1168,7 +1174,7 @@ void RouteFollow::_startTurnStep(const Sensors& s, float ry, uint32_t now) {
   if (now - _settleMs < 500) return;
   for (uint8_t k = 0; k < Sensors::kLidarPoints; k++) _scan[k] = s.lidarCm(k);
   float ax = 0, ay = 0, ath = 0, sc = 0, sec = 0;
-  const bool ok = _lpOn && _lp.alignSearch(_scan, _i, 0.8f, ax, ay, ath, sc, sec);
+  const bool ok = _lpOn && _i < _lp.legs() && _lp.alignSearch(_scan, _i, 0.8f, ax, ay, ath, sc, sec);   // 19.11.: leg 16 no map
   _startRounds++;
   if (ok) {
     _off = _wrap(L.ref + ath * RAD_TO_DEG - s.yawDeg());
@@ -1560,7 +1566,7 @@ bool RouteFollow::_avPhase0Out() const {
 
 // Closest thing ahead: front ultrasonic or the LiDAR rover-wide corridor (2nd closest point: one stray point does not
 // count). agree = both sensors see it at about the same distance (then one scan is enough to stop).
-float RouteFollow::_obsFrontCmNow(const Sensors& s, bool* agree, float half) const {
+float RouteFollow::_obsFrontCmNow(const Sensors& s, bool* agree, float half, float* lidOut) const {
   if (half <= 0) half = obsHalfWM;
   float c = _corridor(s, 0, half, 2.5f);
   // 19.11.: closer than obsSingleM even ONE point counts (a post / a wall corner is one LiDAR return; the SafetyGuard
@@ -1575,6 +1581,7 @@ float RouteFollow::_obsFrontCmNow(const Sensors& s, bool* agree, float half) con
   const int u = s.usCm(0);
   const float us = (u > 2 && u < Sensors::kUsMaxCm) ? (float)u : 999.0f;
   if (agree) *agree = lid < 900.0f && us < 900.0f && fabsf(lid - us) < 25.0f;
+  if (lidOut) *lidOut = lid;
   return fminf(lid, us);
 }
 
@@ -1715,7 +1722,28 @@ void RouteFollow::_obsStart(uint32_t now, bool force, const char* why) {
 bool RouteFollow::_obsDetect(const Sensors& s, const Leg& L, uint32_t now, float& vCap) {
   for (uint8_t k = 0; k < Sensors::kLidarPoints; k++) _scan[k] = s.lidarCm(k);
   bool agree = false;
-  float f = _obsFrontCmNow(s, &agree, curveAvoid ? lidarSideCm / 100.0f + 0.03f : 0.0f);   // v6: the body strip
+  float lidF = 999.0f;
+  float f = _obsFrontCmNow(s, &agree, curveAvoid ? lidarSideCm / 100.0f + 0.03f : 0.0f, &lidF);   // v6: the body strip
+  // 19.11. (log_048): the front ultrasonic alone (floor echo 40-70 cm) counts only below obsUsAloneCm
+  if (!agree && f < lidF && f >= obsUsAloneCm) f = lidF;
+  // 19.11. (log_048, leg 6): wall keep-off - closest LiDAR point beside the body (0.1 m behind .. 0.6 m ahead of the
+  // LiDAR), each side; closer than wallKeepM to the body side -> bend the heading away (applied in _drive, DRIVE only)
+  _wallBias = 0;
+  if (wallKeepM > 0) {
+    const float hw = lidarSideCm / 100.0f;
+    float cl = 9.0f, cr = 9.0f;
+    for (uint8_t k = 0; k < Sensors::kLidarPoints; k++) {
+      const uint16_t cm = _scan[k];
+      if (cm < 15) continue;
+      const float a = (k * 4.0f + 2.0f) * DEG_TO_RAD, rr = cm / 100.0f, al = rr * cosf(a), lt = rr * sinf(a);   // lt + = right
+      if (al < -0.10f || al > 0.60f) continue;
+      if (lt > 0) cr = fminf(cr, lt - hw); else cl = fminf(cl, -lt - hw);
+    }
+    float b = 0;
+    if (cl < wallKeepM) b -= (wallKeepM - fmaxf(cl, 0.0f)) * wallKeepGain;   // wall left -> steer right (- = right)
+    if (cr < wallKeepM) b += (wallKeepM - fmaxf(cr, 0.0f)) * wallKeepGain;
+    _wallBias = _clamp(b, -wallKeepMaxDeg, wallKeepMaxDeg);
+  }
   // v6: curved avoidance may bend the route direction this step (not on a ramp leg, not where the leg ends at a wall)
   _gapOk = curveAvoid && !((rampLegs >> _i) & 1u) && !(L.end == END_FRONT && _eff >= 0.3f * L.effort);
   _gapLineYaw = _lineYaw(L, _stepRy);                              // v6: the line to come back to (path / leg direction)

@@ -29,6 +29,7 @@ public:
     float levelDeg = 8;                       // released again below this (both axes)
     float tiltReverseMax = 0.15f;             // allowed reverse speed while tilted
     int frontStopCm = 50;                     // front ultrasonic (19.11.: was 25)
+    int frontUsAloneCm = 25;                  // 19.11.: ... without the LiDAR agreeing only this close (floor echo)
     bool useFrontAngled = true;               // see NOTE above
     // 19.11. (course rule 17.11.: no turning on the spot): when a stop blocks the forward / backward part, the steering
     // part goes too. Before, v = 0 kept w -> left and right wheels opposite = a turn on the spot (and with curveOnly a
@@ -66,7 +67,8 @@ public:
       const bool usNear = _valid(s.usCm(0)) && s.usCm(0) < cfg.frontStopCm;
       if (!usNear) _usMs = 0; else if (_usMs == 0) _usMs = millis() | 1u;
       // 19.11. (rain, log_043: a wet sensor read 16 cm for seconds): alone it must hold 1 s (was 300 ms)
-      if (usNear && (millis() - _usMs >= 1000 || _lidarFrontMinCm(s) < (uint16_t)(cfg.frontStopCm + 30))) why = FRONT_US;
+      // 19.11. (log_048: floor echo 40-70 cm with the LiDAR free) alone only below frontUsAloneCm
+      if (usNear && ((s.usCm(0) < cfg.frontUsAloneCm && millis() - _usMs >= 1000) || _lidarFrontMinCm(s) < (uint16_t)(cfg.frontStopCm + 30))) why = FRONT_US;
       else if (cfg.useFrontAngled && _valid(s.usCm(4)) && s.usCm(4) < cfg.angledStopCm) why = FRONT_ANGLED;
       else if (_lidarFrontMinCm(s) < cfg.lidarStopCm) why = FRONT_LIDAR;
       else if (_sideNear(s, 1) || _sideNear(s, 2)) why = SIDE_US;   // 19.11.

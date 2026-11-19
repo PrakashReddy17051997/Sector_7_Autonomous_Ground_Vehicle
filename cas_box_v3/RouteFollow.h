@@ -358,6 +358,14 @@ public:
   float obsStopCm = 35;           // stop this far from the obstacle (rover front)
   float obsLeadCm = 6;            // trigger this much earlier: what the rover still rolls during the firm stop
   float obsSlowCm = 100;          // slow down below this
+  // 19.11. (log_048): the front ultrasonic sees the FLOOR at 40-70 cm about half the time (LiDAR > 1.5 m free) -> 2 such
+  // readings started a detour (43 AVOID starts, back and forth). Alone (LiDAR does not agree) it now counts only closer
+  // than this (a shoe the LiDAR plane misses is still caught here).
+  float obsUsAloneCm = 25;
+  // 19.11. (log_048, leg 6 D-E): 6 min pressed against the left wall (LiDAR left 22 cm, US 14 cm), the side stop and the
+  // detour fought it. In DRIVE the heading is now bent away from a wall closer than wallKeepM to the body side
+  // (wallKeepGain deg per metre too close, at most wallKeepMaxDeg). 0 = off.
+  float wallKeepM = 0.12f, wallKeepGain = 80.0f, wallKeepMaxDeg = 12.0f;   // sim leg 6: 0.25 m bent it off near the ramp columns
   float obsSlowV = 0.20f;         // ... to this (and the detour speed). Rover 7 moves at >= 0.15
   float obsSideKeepCm = 35;       // side gap held by the side ultrasonic while going round
   float obsSeeCm = 75;            // side reading below this = obstacle beside the rover
@@ -560,7 +568,7 @@ private:
   bool _obsDetect(const Sensors& s, const Leg& L, uint32_t now, float& vCap);
   void _obsStart(uint32_t now, bool force, const char* why);
   void _avoidSimple(const Sensors& s, const Leg& L, float ry, uint32_t now);
-  float _obsFrontCmNow(const Sensors& s, bool* agree, float half = 0) const;   // half 0 = obsHalfWM
+  float _obsFrontCmNow(const Sensors& s, bool* agree, float half = 0, float* lidOut = nullptr) const;   // half 0 = obsHalfWM
   float _obsSideCmNow(const Sensors& s, int8_t os, float alMax) const;
   float _obsLidarSide(const Sensors& s, int8_t os, float alMin, float alMax, float latMax, uint8_t* n) const;
   float _obsLaneFree(const Sensors& s, float relDeg, float offM, float half, float look) const;
@@ -573,6 +581,7 @@ private:
   void _gapSteer(float& e, float& v);
   void _avoidCurve(const Sensors& s, const Leg& L, float ry, uint32_t now);
   bool _gapOk = false, _gapDeviating = false;
+  float _wallBias = 0;   // 19.11.: wall keep-off (deg, + = left), set by _obsDetect each DRIVE step
   float _gapDevDeg = 0, _gapLat = 0, _gapOdo = 0, _gapRevOdo = 0, _gapRecEff = 0;
   int8_t _gapRevDir = 0;
   uint8_t _gapRec = 0;

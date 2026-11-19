@@ -286,10 +286,10 @@ static bool setRoute(RouteFollow& rf, const std::string& kv) {
 #define F(x) if (n == #x) { rf.x = v; return true; }
 #define B(x) if (n == #x) { rf.x = v != 0; return true; }
 #define U(x) if (n == #x) { rf.x = (decltype(rf.x))v; return true; }
-  F(pivotDeg) F(turnDoneDeg) F(pivotDoneDeg) F(turnCmd) F(kethanCmd) F(rollCmd) F(rollMaxM) F(rollGoV) F(avoidPlanM)
+  F(wallKeepM) F(obsUsAloneCm) F(pivotDeg) F(turnDoneDeg) F(pivotDoneDeg) F(turnCmd) F(kethanCmd) F(rollCmd) F(rollMaxM) F(rollGoV) F(avoidPlanM)
   F(avMinScore) F(avoidEnterM) F(hardStopM) F(lmkParaExtraDeg) F(lmkRollDeg) F(lmkTiltDeg) F(climbPow) F(trimMax)
   F(avAngleDeg) F(avClearM) F(avMinClearM) F(avMaxShiftM) B(kTurn) F(kOuter) F(kInner) F(kSegM) U(kSegMs) F(fwdMoveStartM) F(fwdMoveMaxM) F(backShiftMaxM)
-  B(rollStart) B(smartAvoid) B(turnTactics) B(alignStart) B(trimLearn) B(smoothReroute) B(staticFilter)
+  B(curveAvoid) B(simpleAvoid) B(rollStart) B(smartAvoid) B(turnTactics) B(alignStart) B(trimLearn) B(smoothReroute) B(staticFilter)
   U(stuckWindows) U(maxBackups) U(rollCarryMs)
 #undef F
 #undef B
@@ -382,7 +382,7 @@ int main(int argc, char** argv) {
   rf.kethanCmd = 0.50f;
   if (lmk) {
     rf.setLandmarkLeg(2 - 1, kOpenSea, LMK_COUNT(kOpenSea));
-    for (const LmkLegReg& g : kLmkLegs) rf.setLandmarkLeg(g.leg - 1, g.ph, g.n, g.lenM);
+    for (const LmkLegReg& g : kLmkLegs) rf.setLandmarkLeg(g.leg - 1, g.ph, g.n, g.lenM);   // as cas_box_v3.ino
   }
   for (const std::string& kv : routeSets) if (!setRoute(rf, kv)) { fprintf(stderr, "unknown --set %s\n", kv.c_str()); return 1; }
   for (const std::string& kv : shaperSets) if (!setShaper(shaper, kv)) { fprintf(stderr, "unknown --shaper %s\n", kv.c_str()); return 1; }
