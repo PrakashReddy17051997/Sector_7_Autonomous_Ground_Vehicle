@@ -119,6 +119,20 @@ const float ROVER_TRIM_START = 0.25f;
 // "SMART OBSTACLES"). false = the v3 handling (wait 3 s, sidestep). The FIRM stop for obstacles is on either way
 // (it is what keeps the rover from rolling into an obstacle after the 2 s S-curve).
 const bool SMART_OBSTACLES = true;
+// ---- v5 VINAY (16.11.): simple sensor detour (RouteFollow.h "SIMPLE SENSOR DETOUR") ----------------------------------
+// true: stop 35 cm before an obstacle (LiDAR + front ultrasonic), turn 30-60 deg (from the obstacle's LiDAR shape) to
+// the free side, curve round it holding 35 cm (LiDAR + filtered side ultrasonic) and curve back onto the path. Overrides SMART_OBSTACLES. false = v4 as before.
+const bool SIMPLE_AVOID = true;
+// v6 (19.11.): CURVED avoidance for the 25 cm box (RouteFollow.h "CURVED AVOIDANCE"): bends round obstacles while
+// rolling (no stop, no K-turn), squeezes through gaps of body + 5 cm (corridors), backward curve only if something is
+// inside 35 cm. false = the v5b stop-and-turn detour.
+const bool CURVE_AVOID = true;
+const float OBS_STOP_CM = 35;        // stop this far from the obstacle (rover front)
+const float OBS_SIDE_KEEP_CM = 35;   // gap to the obstacle while going round (side ultrasonic)
+// MEASURE these two on the rover (tape from the LiDAR's centre): they turn LiDAR distances into body distances
+const float LIDAR_NOSE_CM = 12.5f;   // LiDAR centre -> front bumper (v6: 25 cm box, LiDAR in the middle)
+const float LIDAR_SIDE_CM = 12.5f;   // LiDAR centre -> left / right side of the body
+const float LIDAR_REAR_CM = 12.5f;   // LiDAR centre -> rear bumper
 
 // ---- objects ---------------------------------------------------------------------------------
 WebHMI hmi;           // web server + page
@@ -285,6 +299,13 @@ void setup() {
   mission.route.alignStart = START_ALIGN;
   mission.route.trim = cal.trim();   // 19.11.: saved start trim (default ROVER_TRIM_START)
   mission.route.smartAvoid = SMART_OBSTACLES;   // v4
+  mission.route.simpleAvoid = SIMPLE_AVOID;     // v5 Vinay: 35 cm stop + turn + side keeping (wins over v4)
+  mission.route.curveAvoid = CURVE_AVOID;       // v6: curved avoidance (needs SIMPLE_AVOID)
+  mission.route.obsStopCm = OBS_STOP_CM;
+  mission.route.obsSideKeepCm = OBS_SIDE_KEEP_CM;
+  mission.route.lidarNoseCm = LIDAR_NOSE_CM;
+  mission.route.lidarSideCm = LIDAR_SIDE_CM;
+  mission.route.lidarRearCm = LIDAR_REAR_CM;
   if (OPEN_SEA_LEG) mission.route.setLandmarkLeg(OPEN_SEA_LEG - 1, kOpenSea, LMK_COUNT(kOpenSea));
   if (BLOCK_I_LEG) mission.route.setLandmarkLeg(BLOCK_I_LEG - 1, kBlockI, LMK_COUNT(kBlockI));
   // 11.11. (log_032): legs 6-15 (ramp M51-M57 and the open area M57-M72) on landmark lines, tables from log_027
@@ -431,6 +452,16 @@ void loop() {
   if (now - lastUi >= 500) {  // status line + values in the "Dev" view
     lastUi = now;
     String state = rover.statusText();
+    if (SIMPLE_AVOID && CURVE_AVOID)   // v6: curving round / back in DRIVE, 40 stop 41 backward curve 42 stand
+      hmi.showValue("route.avoid", (mission.route.avoidPhase() || mission.route.gapActive()) ?
+                    String(mission.route.avoidPhase() ? "phase " + String(mission.route.avoidPhase()) + " (40 stop 41 backward curve 42 stand)"
+                                                      : "curving round " + String(mission.route.gapDevDeg(), 0) + " deg") +
+                    ", front " + String(mission.route.obsFrontCm(), 0) + " cm, " + mission.route.msg() : String("-"));
+    else if (SIMPLE_AVOID)   // v5b: 20 stop, 21 turn, 22 out, 23 arc in, 24 pass, 25 return, 29 hold
+      hmi.showValue("route.avoid", mission.route.avoidPhase() ? String("phase ") + mission.route.avoidPhase() +
+                    " (20 stop 21 turn 22 out 23 arc in 24 pass 25 return 29 hold), front " + String(mission.route.obsFrontCm(), 0) +
+                    " cm, side " + String(mission.route.obsSideCm(), 0) + " cm, " + mission.route.msg() : String("-"));
+    else
     hmi.showValue("route.avoid", mission.route.avoidPhase() ? String("phase ") + mission.route.avoidPhase() + " (1 out, 2 pass, 3 back), " +
                   mission.route.msg() : String("-"));
     if (safetyReason != SafetyGuard::OK) state = String(SafetyGuard::reasonText(safetyReason)) + " | " + state;

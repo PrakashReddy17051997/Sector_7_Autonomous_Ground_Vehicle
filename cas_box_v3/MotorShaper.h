@@ -51,6 +51,9 @@ public:
   // linearly at wheelRate per second to its target. The speed / turn ramps (2 s S-curve / 0.5 per s) would make the
   // wheels opposite for most of every piece (= a pivot = no turn on rover 7); per wheel the curve shape is kept.
   bool wheelRamp = false;
+  // 19.11. (course rule: no turning on the spot): when the asked wheels are NOT opposite, the outputs never are either
+  // - the turn ramp (wUp) is faster than the S-curve speed ramp, so from low speed |w| > |v| = a short spot turn.
+  bool noSpotTurn = true;
   float wheelRate = 0.8f;
 
   void setPitch(float) {}                       // slope factor removed (kept for the interface)
@@ -115,8 +118,10 @@ public:
     _w += constrain(wt - _w, -wr, wr);
     if (fabsf(_w) < 0.001f) _w = 0;
 
-    l = constrain(_v - _w, -0.5f, 0.5f);
-    r = constrain(_v + _w, -0.5f, 0.5f);
+    float wo = _w;
+    if (noSpotTurn && !pivot && fabsf(wo) > fabsf(_v)) wo = (wo > 0 ? 1.0f : -1.0f) * fabsf(_v);   // 19.11.
+    l = constrain(_v - wo, -0.5f, 0.5f);
+    r = constrain(_v + wo, -0.5f, 0.5f);
     _wl = l; _wr = r;
     if (fabsf(l) < zero) l = 0;
     if (fabsf(r) < zero) r = 0;

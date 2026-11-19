@@ -30,6 +30,10 @@ public:
     float tiltReverseMax = 0.15f;             // allowed reverse speed while tilted
     int frontStopCm = 50;                     // front ultrasonic (19.11.: was 25)
     bool useFrontAngled = true;               // see NOTE above
+    // 19.11. (course rule 17.11.: no turning on the spot): when a stop blocks the forward / backward part, the steering
+    // part goes too. Before, v = 0 kept w -> left and right wheels opposite = a turn on the spot (and with curveOnly a
+    // stop-start loop: RouteFollow zeroes both, asks again, the guard turns it into a spot turn again).
+    bool noSpotTurn = true;
     int angledStopCm = 25;                    // front-angled ultrasonic
     int lidarStopCm = 30;                     // LiDAR in the front sector
     int lidarHalfAngleDeg = 20;               // front sector = +-20 deg
@@ -75,6 +79,7 @@ public:
     }
 
     if (why != OK) {
+      if (cfg.noSpotTurn && v == 0) w = 0;   // 19.11.: never only the steering part (= a turn on the spot)
       l = constrain(v + w, -0.5f, 0.5f);
       r = constrain(v - w, -0.5f, 0.5f);
     }

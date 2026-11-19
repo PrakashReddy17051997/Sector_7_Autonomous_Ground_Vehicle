@@ -268,7 +268,7 @@ public:
   // a locked path localizer must agree that the leg is (nearly) done: s >= lpEndAgreeFrac * sEnd - 0.5 m (log_031)
   float lpEndAgreeFrac = 0.85f;         // start alignment: turn steps (<= 90 deg each) + LiDAR re-checks
   bool tacticActive() const { return active() && _pivoting && turnTactics; }   // -> fast turn ramp in MotorShaper
-  bool wheelRamp() const { return tacticActive() && _tk == TK_KTURN; }   // -> MotorShaper ramps each WHEEL (keeps the curve)
+  bool wheelRamp() const { return (tacticActive() && _tk == TK_KTURN) || (_state == AVOID && _avPhase == 41); }   // v6: backward curve too   // -> MotorShaper ramps each WHEEL (keeps the curve)
   const char* tacticMsg() const { return _tacMsg; }
   // ---- v4 (11.11., tools/v4_test/obstacle_sim on the real route code) ------------------------------
   // SMART OBSTACLES. v3 saw a NEW thing on the locked path only inside hardStopM (0.45 m) and then braked with the
@@ -293,7 +293,96 @@ public:
   float avMoveM = 0.10f;          // obstacle moved more than this between scans while we stand: it is moving
   uint32_t staticMs = 750;        // ... not moved for this long: static -> detour now
   float avMinScore = 0.6f;        // early (1.5 m) detection only with a LiDAR match at least this good
-  bool firmStop() const { return active() && _state == AVOID && _avPhase < 10; }   // 18.11.: emergency only (obstacle stop), back-up ramps softly   // -> MotorShaper.firm
+  bool firmStop() const { return active() && _state == AVOID && (_avPhase < 10 || _avPhase >= 20); }   // v5: + the simple detour   // 18.11.: emergency only (obstacle stop), back-up ramps softly   // -> MotorShaper.firm
+
+  // ---- v5 VINAY (16.11.): SIMPLE SENSOR DETOUR - LiDAR + ultrasonics, 35 cm rule ----------------------------------
+  // Replaces the v4 smart detour / smooth reroute while simpleAvoid = true (cas_box: SIMPLE_AVOID). Problem it fixes:
+  // the v4 detour needed a free 30-45 deg diagonal, did not find one close to the obstacle, backed up ~0.5 m, failed
+  // again and PAUSED ("moves slightly back and stops"); the SafetyGuard hold in DRIVE also only backed up.
+  //   DETECT  front distance = min(front ultrasonic, LiDAR rover-wide corridor - lidarNoseCm). Below obsSlowCm the
+  //           speed is capped at obsSlowV; at obsStopCm + obsLeadCm (both sensors agree: 1 scan, one sensor: 2 scans)
+  //           -> FIRM stop, the rover stands ~obsStopCm (35 cm) from the obstacle. Walls of the taught map (path
+  //           locked, nothing NEW ahead) keep the old rules (END_FRONT leg end, lpStopM) - corners are not obstacles.
+  //   20 STOP     stand, wait obsWaitMs (a person walks on -> drive on)
+  //               v5b: look at the obstacle with the LiDAR (front face distance, left / right edges) and work out
+  //               per side: the sideways shift (edge + half body + 35 cm) and the turn ANGLE that clears the near
+  //               corner, atan(edge + half body + obsCornerM, face distance), obsMinDeg..obsMaxDeg - so a thin pole
+  //               gets ~30 deg, a 0.5 m box ~45 deg, a wide one ~60 deg. The LiDAR must show that diagonal free,
+  //               else 15 deg steeper (up to 90). Side: the smaller shift, then the flatter angle, then more room;
+  //               never right on noRight legs. No way: back up once and look again, then PAUSE.
+  //   21 TURN     turn to that angle (gyro, the normal turn tactics)
+  //   22 OUT      diagonal at that angle. Corner comes within the stop distance -> 15 deg steeper (back to 21).
+  //               Done when the LiDAR shows the line direction free for body + 35 cm (2 scans), or for body
+  //               + 12 cm with the planned shift reached
+  //   23 ARC IN   curve back to the line direction while rolling (no stop / pivot); too close -> straight on.
+  //               It starts early by the outward drift of the curve, R (1 - cos angle); R is learned per curve
+  //   24 PASS     parallel, keep 35 cm: side distance = LiDAR beside the rover + side ultrasonic (median of 3,
+  //               single wrong echoes dropped). Passed = the LiDAR sees nothing beside the body from behind the
+  //               rear to 0.3 m ahead (2 scans) and the filtered ultrasonic agrees
+  //   25 RETURN   curve to the line at obsBackDeg (45, 30 if the LiDAR shows 45 blocked), flattening out as
+  //               the offset goes (path localiser cross-track, else dead reckoning) -> DRIVE lined up
+  //   29 HOLD     something ahead during the detour (< obsStopCm + obsLeadCm): stand; free again -> go on,
+  //               still blocked after obsBlockedWaitMs -> PAUSE
+  bool simpleAvoid = true;
+  // ---- v6 (19.11., Vinay): CURVED AVOIDANCE for the 25 cm box rover, curve-only (no turn on the spot, no K-turn) ----
+  // Replaces the stop-and-turn detour (phases 19-29) while curveAvoid = true. Every LiDAR scan in DRIVE:
+  //   lanes   headings around the route direction (+-gapMaxDevDeg, 4 deg steps) are scored by how far a strip as
+  //           wide as the BODY is free: first body + obsSideKeepCm (35 cm gap, open ground), else body + gapMarginM
+  //           (corridors / narrow gaps: building walls alongside never block a strip only as wide as the body)
+  //   steer   the route direction if its strip is free for gapNeedM; else the nearest free heading - the rover
+  //           CURVES there while rolling (wheel difference only, never opposite wheels), and back when it is past
+  //   back    on legs without the taught path the sideways offset is dead-reckoned and steered back to the line
+  //   walls   nothing free anywhere (a wall across), a leg that ends at a wall ahead, mapped walls on the taught
+  //           path, ramps: no deviation - the old rules / the 35 cm stop handle them
+  //   close   something inside obsStopCm (35 cm) in the body strip anyway (it stepped in late): soft stop, wait
+  //           obsWaitMs (people), then a BACKWARD CURVE (both wheels backward, the nose swings to the free side)
+  //           until a free heading is reachable by a forward curve, then curve past (phases 40-42)
+  bool curveAvoid = true;
+  float gapMarginM = 0.05f;       // narrowest pass: body + this on each side
+  float gapLookM = 3.5f;          // LiDAR look-ahead of the lanes
+  float gapNeedM = 3.0f;          // a heading counts as free when its strip is free this far (from the LiDAR):
+                                  // early - a rolling curve of the rover turns only a few deg per second
+  float gapMaxDevDeg = 60;        // furthest it looks off the route direction
+  float gapWideMaxDeg = 25;       // a 35 cm-gap heading beats a narrow gap only within this of the route
+  float obsGapPastM = 0.8f;
+  float gapLaneMaxM = 1.2f;       // narrow-gap lanes: sideways search range       // narrow-gap mode: the heading's strip must be free this far past the obstacle
+  float gapEngageDeg = 30;        // avoidance only while the route direction is within this of the nose
+  float gapRollMaxDeg = 22;       // heading error given to the controller while avoiding (< pivotDeg: rolls)
+  float gapRetDegPerM = 30, gapRetMaxDeg = 15;   // back to the line (legs without the taught path)
+  float gapRevMaxM = 1.2f;        // close obstacle: backward curve at most this far
+  uint8_t gapRecoverMax = 3;
+  float obsCornerStopM = 0.015f;  // v6: something this close beside the front half of the body -> stop at once      // close-obstacle recoveries per obstacle before a PAUSE
+  bool gapActive() const { return _gapDeviating; }
+  uint32_t gapRecentMs = 4000;    // after avoiding: this long no K-turn back to the path, a curve instead
+  float gapDevDeg() const { return _gapDevDeg; }
+  float obsStopCm = 35;           // stop this far from the obstacle (rover front)
+  float obsLeadCm = 6;            // trigger this much earlier: what the rover still rolls during the firm stop
+  float obsSlowCm = 100;          // slow down below this
+  float obsSlowV = 0.20f;         // ... to this (and the detour speed). Rover 7 moves at >= 0.15
+  float obsSideKeepCm = 35;       // side gap held by the side ultrasonic while going round
+  float obsSeeCm = 75;            // side reading below this = obstacle beside the rover
+  float obsSideNeedM = 0.70f;     // a side counts as free with this much room (LiDAR 90 deg corridor + side US)
+  float obsHalfWM = 0.175f;       // v6: 25 cm box -> body 0.125 + 5 cm (was 0.20 for rover 7's 0.26 m)        // half width of the corridor checked ahead / to the side (rover 0.13 + 7 cm)
+  float obsMinDeg = 30, obsMaxDeg = 75;   // v5b: turn-out angle limits (from the obstacle's shape, 90 only if needed)
+  float obsBackDeg = 45;          // angle back to the line (30 if the LiDAR shows 45 blocked)
+  float obsCornerM = 0.20f;       // the diagonal passes the near corner with this much room (gives ~35 cm body gap)
+  float obsArcDeg = 20;           // heading error per step while curving (below pivotDeg: rolls, does not pivot)
+  float obsSeeWithinM = 1.5f;     // never seen beside after this far: count it as passed
+  float obsMaxShiftM = 1.8f;      // wider than this sideways: PAUSE (wall across the way)
+  float obsKeepKp = 0.5f, obsKeepMaxDeg = 15;   // side keeping: deg per cm off obsSideKeepCm, limit
+  uint32_t obsWaitMs = 1500, obsBlockedWaitMs = 4000, obsTurnTimeoutMs = 45000, obsMaxMs = 240000;   // 19.11.: K-turns are slow
+  float obsRoomM = 0.90f, obsRoomBackM = 0.60f;   // 19.11. curve-only: reverse straight until the face is this far (at most)
+  float obsKturnLossM = 0.10f;      // 19.11.: a K-turn back to the line direction ends this much nearer the line
+  uint8_t obsReplanMax = 2;         // 19.11.: blocked while passing -> turn out again this often before a pause
+  float obsMinKeepCm = 15;          // 19.11. corridor mode: smallest side gap tried when 35 cm does not fit
+  float obsSingleM = 0.50f;         // 19.11.: closer than this a single LiDAR point counts as an obstacle ahead
+  uint32_t obsStallMs = 3000;       // 19.11.: asking forward but not moving this long -> back a little, out again
+  float obsLaneLookM = 1.0f;        // 19.11.: the lane beside the obstacle must be free this far past its face
+  float lidarNoseCm = 12.5f;         // LiDAR centre -> rover front (cm). MEASURE on the rover (cas_box: LIDAR_NOSE_CM)
+  float lidarSideCm = 12.5f;         // LiDAR centre -> rover side (cm). MEASURE on the rover (cas_box: LIDAR_SIDE_CM)
+  float lidarRearCm = 12.5f;         // LiDAR centre -> rear bumper (cm). MEASURE on the rover (cas_box: LIDAR_REAR_CM)
+  float obsFrontCm() const { return _obsFront; }   // last fused front distance (page)
+  float obsSideCm() const { return _obsSide; }     // last side distance used for keeping (page, 999 = none)
   // SMOOTH REROUTE (v4b, 11.11.): a static thing seen EARLY (new points up to rrLookM ahead on the locked path,
   // 2 scans) is passed on a planned smooth curve without stopping:
   //   lateral offset y(s) along the line (dead-reckoned frame of the moment it was seen):
@@ -317,8 +406,8 @@ public:
   float rrLd = 0.8f;              // pure-pursuit look-ahead on the curve
   float rrMaxWidthM = 0.8f;       // wider obstacles: the stop + 45 deg detour (sim: walls beside are handled better)
   // a curve needs the obstacle >= 0.7 * ramp + 0.5 m ahead (the rover lags the curve); seen later: stop + 45 deg detour
-  bool rerouting() const { return _state == AVOID && _avPhase >= 10; }
-  uint8_t avoidPhase() const { return _state == AVOID ? _avPhase : 0; }   // 1-3 detour, 10-12 smooth reroute
+  bool rerouting() const { return (_state == AVOID && _avPhase >= 10) || _gapDeviating; }   // v6: avoiding curve -> bigger wheel difference
+  uint8_t avoidPhase() const { return _state == AVOID ? _avPhase : 0; }   // 1-3 detour, 10-12 smooth reroute, 20-29 v5
 
   float _roll0 = 0;                   // (12.11.) roll at the leg start: side lines are checked against the ROLL
   bool alignStart = true;
@@ -467,6 +556,51 @@ private:
   float _rrObY = 0;
   void _avoidSmart(const Sensors& s, const Leg& L, float ry, uint32_t now);
   float _newAhead(const Sensors& s, float look, float* lat);
+  // v5 simple sensor detour
+  bool _obsDetect(const Sensors& s, const Leg& L, uint32_t now, float& vCap);
+  void _obsStart(uint32_t now, bool force, const char* why);
+  void _avoidSimple(const Sensors& s, const Leg& L, float ry, uint32_t now);
+  float _obsFrontCmNow(const Sensors& s, bool* agree, float half = 0) const;   // half 0 = obsHalfWM
+  float _obsSideCmNow(const Sensors& s, int8_t os, float alMax) const;
+  float _obsLidarSide(const Sensors& s, int8_t os, float alMin, float alMax, float latMax, uint8_t* n) const;
+  float _obsLaneFree(const Sensors& s, float relDeg, float offM, float half, float look) const;
+  // v6 curved avoidance
+  float _gapFree(float devDeg, float half, float look) const;
+  float _gapSide(int8_t os) const;
+  bool _gapCentre(float relDeg, float look, float& lo) const;
+  float _gapLaneFree(float relDeg, float offM, float half, float look) const;
+  bool _gapPick(float e, float half, float need, float& out) const;
+  void _gapSteer(float& e, float& v);
+  void _avoidCurve(const Sensors& s, const Leg& L, float ry, uint32_t now);
+  bool _gapOk = false, _gapDeviating = false;
+  float _gapDevDeg = 0, _gapLat = 0, _gapOdo = 0, _gapRevOdo = 0, _gapRecEff = 0;
+  int8_t _gapRevDir = 0;
+  uint8_t _gapRec = 0;
+  uint32_t _gapLastMs = 0, _gapDevMs = 0;
+  float _gapLineYaw = 0, _gapCrab = 0, _gapRefYaw = 0;
+  bool _gapRefOn = false, _gapLaneOn = false, _gapBaseOn = false;
+  float _gapBaseYaw = 0;
+  bool _gapRecent(uint32_t now) const { return _gapLastMs && now - _gapLastMs < gapRecentMs; }
+  void _obsUsUpdate(const Sensors& s);
+  void _obsUsReset(const Sensors& s);
+  float _usHist[2][3] = {{999, 999, 999}, {999, 999, 999}}, _usSide[2] = {999, 999};
+  uint8_t _usHi = 0, _obsClrN = 0;
+  bool _usReset = true;
+  bool _obsRoomDone = false;                        // 19.11.: curve-only room reversal done for this obstacle
+  uint8_t _obsReplanN = 0;
+  float _keepCm = 35;                               // 19.11.: side gap of this detour (corridor mode)
+  uint32_t _obsStallMs = 0;
+  float _obsStallOdo = 0;                           // 19.11.: stall check window (odometry)
+  uint8_t _obsRevRet = 20;                          // phase after the reversal (19)
+  float _obsRevM = 0.6f, _obsRevOdo = 0;
+  float _arcR = 0.8f, _arcLat0 = 0, _arcAng0 = 0;   // v5b: curve radius (m), learned on every curve back
+  float _avAng = 45, _avRet = 45;
+  int8_t _obsChooseSide(const Sensors& s, const Leg& L);
+  float _obsKeep(float sideCm, int8_t os, bool awayOnly) const;
+  bool _obsForce = false, _obsSeen = false;
+  uint8_t _obsMissN = 0, _obsRet = 0, _obsResumePh = 0;
+  float _obsLeg0 = 0, _obsClearAt = -1, _obsFront = 999, _obsSide = 999;
+  uint32_t _obsT0 = 0, _obsHoldMs = 0;
 
   // stuck detection
   uint16_t _ref[Sensors::kLidarPoints];

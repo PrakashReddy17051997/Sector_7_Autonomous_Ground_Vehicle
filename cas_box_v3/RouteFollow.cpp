@@ -120,6 +120,7 @@ bool RouteFollow::resume(float speed) {
   }
   _state = _resumeState == TURN ? TURN : DRIVE;
   _stuckN = 0; _refMs = 0; _I = 0; _lowN = 0; _pivoting = false; _yawDesInit = false; _tapPh = 0;
+  _obsResumePh = 0;   // v5: a paused detour is not continued after Resume (the leg steering takes the path)
   _stateMs = millis();
   snprintf(_msg, sizeof(_msg), "resumed leg %u: %s", (unsigned)(_i + 1), _cur().name);
   return true;
@@ -241,6 +242,8 @@ float RouteFollow::_scanChangeCm(const Sensors& s) const {
 // Sets the target for _control: e = wanted - current heading (deg, + = left), v = forward command,
 // fwd = roll forwards (else backwards, e.g. obstacle ahead). Called from the 4 Hz _step.
 void RouteFollow::_drive(float e, float v, bool fwd) {
+  if (fwd && _gapOk && _state == DRIVE) _gapSteer(e, v);   // v6: curved avoidance bends the route direction
+  else if (_state != DRIVE) _gapDeviating = false;
   _tgtYaw = _wrap(_stepRy + e);              // absolute target, from the snapshot heading of this step
   _tgtV = v;
   _tgtFwd = fwd;
@@ -341,8 +344,14 @@ void RouteFollow::_control(const Sensors& s) {
     _trimS += dt;   // 19.11.: learning time (CalibrationManager saves the trim only after enough)
   }
   if (base > 0.1f && dt > 0 && dt < 0.1f) _driveS += dt;
-  _l = base - _hc - base * trim;            // trim: + = more on the right wheel (turns left), like Arjun's RoverTrim
-  _r = base + _hc + base * trim;
+  // 19.11. (sim, detour + curveOnly: stood for minutes): the TRIM part was not limited by vRef - from standstill
+  // base * trim alone (rover 7: trim up to 0.15 -> 0.03) made |w| > |v|, the curveOnly check above zeroed both, the
+  // next step asked again = a stop-start loop that never moved. curveOnly: the WHOLE wheel difference stays below the
+  // speed the wheels really have (both wheels the same direction).
+  float diff = _hc + base * trim;
+  if (curveOnly) { const float dl = fminf(0.9f * vRef, 0.8f * fabsf(_outV)); diff = _clamp(diff, -dl, dl); }   // |w| < |v|: never opposite
+  _l = base - diff;                         // trim: + = more on the right wheel (turns left), like Arjun's RoverTrim
+  _r = base + diff;
   _why = _tgtFwd ? WHY_ROLL : WHY_STAND;
 }
 
@@ -494,6 +503,8 @@ void RouteFollow::_step(const Sensors& s, const WallFollow& wf) {
     _stuckN = 0;
     // 11.11. (log_032 M47/48: rear wheels hanging on a step, the heading hold kept one side at 0.09): first push
     // STRAIGHT on both wheels (climbPow, no steering) for climbMs, twice per leg - then back up as before
+    // v5: stuck in the middle of a simple detour -> after the push / back-up go on with the detour (not DRIVE)
+    _obsResumePh = (simpleAvoid && _state == AVOID && _avPhase >= 21 && _avPhase <= 26) ? _avPhase : 0;
     if (_climbN < 2) {
       _climbN++;
       _state = BACKUP; _stateMs = now; _climbUntil = now + climbMs;
@@ -512,6 +523,12 @@ void RouteFollow::_step(const Sensors& s, const WallFollow& wf) {
   // back up (if the rear is free), then the route tries again.
   if (_state == DRIVE && 0.5f * (_l + _r) > 0.05f && fabsf(_outV) < 0.01f) { if (!_guardMs) _guardMs = now; }
   else _guardMs = 0;
+  // v5 (Vinay): with the simple detour the hold is an obstacle -> stop + go round (not back up and give up)
+  if (simpleAvoid && _guardMs && now - _guardMs > 1000) {
+    _guardMs = 0;
+    _obsStart(now, true, "safety stop - going round");
+    return;
+  }
   if (_guardMs && now - _guardMs > 2500) {
     _guardMs = 0;
     if (++_backups >= maxBackups) { pause("held by the safety stop - help me, then Resume"); return; }
@@ -523,15 +540,20 @@ void RouteFollow::_step(const Sensors& s, const WallFollow& wf) {
   }
 
   switch (_state) {
-    case BACKUP:
+    case BACKUP: {
+      // v5: the straight climb push keeps the 35 cm rule too (it pushed to 22 cm from a box in the host sim)
+      if (simpleAvoid && now < _climbUntil && _obsFrontCmNow(s, nullptr) <= obsStopCm + obsLeadCm) _climbUntil = now;
+      // v5: after a push / back-up in the middle of a simple detour: go on with the detour
+      const uint8_t back = _obsResumePh ? (uint8_t)AVOID : (uint8_t)DRIVE;
       if (now < _climbUntil) { _l = _r = climbPow; return; }               // climb push first
       if (_climbUntil != 0 && now - _climbUntil < 300) { _l = _r = 0; return; }
-      if (_climbUntil != 0) { _climbUntil = 0; _state = DRIVE; return; }   // after the push: drive on (check again)
+      if (_climbUntil != 0) { _climbUntil = 0; _state = back; if (_obsResumePh) { _avPhase = _obsResumePh; _obsResumePh = 0; _stateMs = now; } return; }   // after the push: drive on (check again)
       // 12.11. (found with tools/sim_v3): the climb-push change of 11.11. had deleted this line - since then "backing
       // up" never reversed, it kept the last command (often forward into the wall)
       _l = _r = -backupCmd;
-      if (now - _stateMs >= 2500) { _state = DRIVE; _l = _r = 0; }
+      if (now - _stateMs >= 2500) { _state = back; _l = _r = 0; if (_obsResumePh) { _avPhase = _obsResumePh; _obsResumePh = 0; _stateMs = now; } }
       return;
+    }
 
     case TURN: {
       if (_startTurn) { _startTurnStep(s, ry, now); return; }   // v3: start alignment (90 deg steps + re-check)
@@ -551,6 +573,8 @@ void RouteFollow::_step(const Sensors& s, const WallFollow& wf) {
     }
 
     case AVOID: {
+      if (simpleAvoid && curveAvoid) { _avoidCurve(s, L, ry, now); return; }   // v6: close-obstacle recovery (curves)
+      if (simpleAvoid) { _avoidSimple(s, L, ry, now); return; } // v5 (Vinay): 35 cm stop, turn, side keeping
       if (smartAvoid) { _avoidSmart(s, L, ry, now); return; }   // v4
       const float fr = _front(s);
       if (_avPhase == 0) {                     // wait: people / bikes pass by
@@ -559,7 +583,7 @@ void RouteFollow::_step(const Sensors& s, const WallFollow& wf) {
         // path mode: free again = nothing NEW (not in the leg map) in the corridor ahead; mapped walls
         // close to the taught path are fine (you drove past them in the teaching run)
         const bool lpFree = pathLocked() && _corridor(s, 0, 0.18f, 1.5f) > lpStopM + 0.05f && _lp.newPointsAhead(_scan, 0.35f, avoidEnterM) < 2;
-        const bool lpTurn = _pathSteer() && fabsf(_pathErrRad()) * RAD_TO_DEG > 2.0f * turnDoneDeg + 12.0f;
+        const bool lpTurn = _pathSteer() && fabsf(_pathErrRad()) * RAD_TO_DEG > 2.0f * turnDoneDeg + 12.0f && !_gapRecent(now);   // v6: curve back, no K-turn
         if (lpTurn) { _state = TURN; _stateMs = now; return; }
         if (lpFree || fr > avoidFreeM - 0.2f) { _state = DRIVE; strlcpy(_msg, "way free again", sizeof(_msg)); return; }
         if (now - _stateMs < 3000) return;
@@ -615,13 +639,20 @@ void RouteFollow::_step(const Sensors& s, const WallFollow& wf) {
       // path mode: pointing well away from the taught path (leg hand-over at a corner, after passing
       // an obstacle) -> pivot on the spot first; the wall it is facing is not in the way of the path
       if (_pathSteer() && fabsf(_pathErrRad()) * RAD_TO_DEG > 2.0f * turnDoneDeg + 12.0f &&
-          _eff - _noTurnEff > noTurnAfterTimeoutEff) {
+          _eff - _noTurnEff > noTurnAfterTimeoutEff && !_gapRecent(now)) {   // v6: after avoiding: curve back, no K-turn
         _state = TURN; _stateMs = now; _l = _r = 0; return;   // 06.11.: the turn timer starts NOW
       }
       // closer than hardStopM: ALWAYS handle it (log_014: the static filter let it drive into a wall the
       // teaching run had also seen - in the teaching run you turned before it). A leg that ends at a wall
       // ahead (END_FRONT) ends here.
       const bool ramp = onRamp();   // 06.11.: ramp leg AND on the slope now (was: the whole ramp leg)
+      float vCap = _speed;
+      if (simpleAvoid) {
+        // v5 (Vinay): stop 35 cm before it, then turn + go round with the side ultrasonic (see RouteFollow.h).
+        // On the slope the LiDAR sees the ramp surface: no detour there (SafetyGuard ultrasonic + tilt stay on).
+        _gapOk = false;                                              // v6: _obsDetect sets it for this step
+        if (!ramp && _obsDetect(s, L, now, vCap)) return;
+      } else {
       // v4b: a new thing seen EARLY (up to rrLookM, 2 scans in a row) -> smooth reroute without stopping
       if (smartAvoid && smoothReroute && !ramp && !_lmkOn && pathLocked() && _lp.score() >= avMinScore) {
         float nl = 0;
@@ -679,7 +710,8 @@ void RouteFollow::_step(const Sensors& s, const WallFollow& wf) {
         strlcpy(_msg, "obstacle - waiting", sizeof(_msg));
         return;
       }
-      const float v = _speed;                  // no slowing down: wheel differences stall it
+      }   // !simpleAvoid
+      const float v = fminf(_speed, vCap);     // v5: slower only close to an obstacle (else no slowing down: wheel differences stall it)
       if (_lmkOn) { _lmkDrive(s, ry, v); return; }   // v3: landmark leg (own steering + own end)
 
       // ---- where to point
@@ -1520,4 +1552,780 @@ float RouteFollow::_lineYaw(const Leg& L, float ry) const {
 // a detour was under way (offset taken, obstacle not yet passed) -> continue it rather than drive back over it
 bool RouteFollow::_avPhase0Out() const {
   return _avDir != 0 && fabsf(_avLat) > 0.15f && _avS < _avAlong + 0.3f;
+}
+
+// ---- v5 (16.11., Vinay): SIMPLE SENSOR DETOUR - see RouteFollow.h "SIMPLE SENSOR DETOUR" ----------------------------
+// Distances here are from the rover body (cm): ultrasonics measure from the body, LiDAR values get lidarNoseCm /
+// lidarSideCm taken off. 999 = nothing seen.
+
+// Closest thing ahead: front ultrasonic or the LiDAR rover-wide corridor (2nd closest point: one stray point does not
+// count). agree = both sensors see it at about the same distance (then one scan is enough to stop).
+float RouteFollow::_obsFrontCmNow(const Sensors& s, bool* agree, float half) const {
+  if (half <= 0) half = obsHalfWM;
+  float c = _corridor(s, 0, half, 2.5f);
+  // 19.11.: closer than obsSingleM even ONE point counts (a post / a wall corner is one LiDAR return; the SafetyGuard
+  // stops on any single return < 30 cm - with the 2nd-closest rule alone the detour kept pushing against it)
+  for (uint8_t k = 0; k < Sensors::kLidarPoints; k++) {
+    const uint16_t cm = s.lidarCm(k);
+    if (cm < 15 || cm > obsSingleM * 100.0f) continue;
+    const float a = (k * 4.0f + 2.0f) * DEG_TO_RAD, rr = cm / 100.0f, al = rr * cosf(a), lt = rr * sinf(a);
+    if (al > 0 && fabsf(lt) < half && al < c) c = al;
+  }
+  const float lid = c < 2.49f ? c * 100.0f - lidarNoseCm : 999.0f;
+  const int u = s.usCm(0);
+  const float us = (u > 2 && u < Sensors::kUsMaxCm) ? (float)u : 999.0f;
+  if (agree) *agree = lid < 900.0f && us < 900.0f && fabsf(lid - us) < 25.0f;
+  return fminf(lid, us);
+}
+
+// Side ultrasonic, median of the last 3 readings (one wrong echo does not count). os +1 left, -1 right. 999 = none.
+void RouteFollow::_obsUsUpdate(const Sensors& s) {
+  for (uint8_t j = 0; j < 2; j++) {
+    const int u = s.usCm(j == 0 ? 1 : 2);
+    _usHist[j][_usHi] = (u > 2 && u < Sensors::kUsMaxCm) ? (float)u : 999.0f;
+    float a = _usHist[j][0], b = _usHist[j][1], c = _usHist[j][2];
+    _usSide[j] = fmaxf(fminf(a, b), fminf(fmaxf(a, b), c));   // median of 3
+  }
+  _usHi = (_usHi + 1) % 3;
+}
+void RouteFollow::_obsUsReset(const Sensors& s) {
+  for (uint8_t j = 0; j < 2; j++) {
+    const int u = s.usCm(j == 0 ? 1 : 2);
+    const float v = (u > 2 && u < Sensors::kUsMaxCm) ? (float)u : 999.0f;
+    _usHist[j][0] = _usHist[j][1] = _usHist[j][2] = v; _usSide[j] = v;
+  }
+  _usHi = 0;
+}
+
+// LiDAR points on side os (+1 left) between alMin..alMax along the rover (m, + = ahead of the LiDAR):
+// 2nd closest sideways distance (m, 9 = none) and how many points are closer than latMax.
+float RouteFollow::_obsLidarSide(const Sensors& s, int8_t os, float alMin, float alMax, float latMax, uint8_t* n) const {
+  float b1 = 9.0f, b2 = 9.0f;
+  uint8_t c = 0;
+  for (uint8_t k = 0; k < Sensors::kLidarPoints; k++) {
+    const uint16_t cm = s.lidarCm(k);
+    if (cm < 25) continue;
+    const float a = (k * 4.0f + 2.0f) * DEG_TO_RAD, rr = cm / 100.0f, al = rr * cosf(a), lt = rr * sinf(a);   // lt + = right
+    const float side = os > 0 ? -lt : lt;
+    if (side <= 0.05f || al < alMin || al > alMax) continue;
+    if (side < latMax) c++;
+    if (side < b1) { b2 = b1; b1 = side; } else if (side < b2) b2 = side;
+  }
+  if (n) *n = c;
+  return b2;
+}
+
+// LiDAR, in the line-direction frame (relDeg = rover heading - line direction, + = left): 2nd closest point
+// ahead (m along the line) inside a lane of half width `half` whose centre is offM to the left (+) of the rover.
+// look = nothing in the lane.
+float RouteFollow::_obsLaneFree(const Sensors& s, float relDeg, float offM, float half, float look) const {
+  float b1 = look, b2 = look;
+  for (uint8_t k = 0; k < Sensors::kLidarPoints; k++) {
+    const uint16_t cm = s.lidarCm(k);
+    if (cm < 25) continue;
+    const float a = (relDeg - (k * 4.0f + 2.0f)) * DEG_TO_RAD, rr = cm / 100.0f;   // CCW from the line direction
+    const float al = rr * cosf(a), lt = rr * sinf(a) - offM;                       // lt + = left of the lane centre
+    if (al <= 0 || fabsf(lt) >= half) continue;
+    if (al < b1) { b2 = b1; b1 = al; } else if (al < b2) b2 = al;
+  }
+  return b2;
+}
+
+// Gap (cm, from the body) to the obstacle on side os: LiDAR beside / just ahead of the rover + the FILTERED side
+// ultrasonic. The two are checked against each other: an ultrasonic far below a clear LiDAR picture that is not
+// stable (the median already dropped single echoes) still counts - it may be something low the LiDAR looks over.
+float RouteFollow::_obsSideCmNow(const Sensors& s, int8_t os, float alMax) const {
+  const float lid = _obsLidarSide(s, os, -0.05f, alMax, 9.0f, nullptr);
+  const float lidCm = lid < 9.0f ? lid * 100.0f - lidarSideCm : 999.0f;
+  return fminf(lidCm, _usSide[os > 0 ? 0 : 1]);
+}
+
+// Heading correction (deg, + = left) that holds obsSideKeepCm to the obstacle on side os. awayOnly: only push away.
+float RouteFollow::_obsKeep(float sideCm, int8_t os, bool awayOnly) const {
+  if (sideCm >= obsSeeCm) return 0.0f;
+  float c = obsKeepKp * (sideCm - _keepCm);         // + = too far -> towards it, - = too close -> away (19.11.: the gap chosen)
+  if (awayOnly && c > 0) c = 0;
+  return os * _clamp(c, -obsKeepMaxDeg, obsKeepMaxDeg);
+}
+
+// Which way round and how steep: +1 left, -1 right, 0 = no way. Uses the LiDAR picture of the obstacle:
+//   edges (lo..hi) and front face distance -> the sideways shift needed (edge + half body + keep gap) and the
+//   angle that clears the near corner: atan(edge + half body + obsCornerM, distance to the face), limited to
+//   obsMinDeg..obsMaxDeg (a narrow pole -> ~30 deg, a 0.5 m box -> ~45 deg, a wide one -> ~60 deg).
+//   The LiDAR must show that diagonal free (rover width + 7 cm, up to the shift); if not, 15 deg steeper, up to 90.
+//   Both ways possible: the smaller shift, then the flatter angle, then more room.
+int8_t RouteFollow::_obsChooseSide(const Sensors& s, const Leg& L) {
+  const float hw = lidarSideCm / 100.0f;
+  float fr = 0, lo = 0, hi = 0;
+  const bool cl = _avCluster(s, fr, lo, hi);                       // obstacle edges (lo left, hi right; + = right)
+  if (!cl) { fr = fmaxf(_corridor(s, 0, obsHalfWM, 2.0f), 0.3f); lo = -0.25f; hi = 0.25f; }   // not seen: assume 0.5 m
+  const float rel = _wrap(_stepRy - (pathLocked() ? _lineYaw(L, _stepRy) : _stepRy));   // rover vs the line direction
+  float shift[2], ang[2], room[2], keep[2];
+  bool ok[2];
+  // 19.11. CORRIDOR MODE: a side counts only if the LANE beside the obstacle is free for the body (LiDAR, from the
+  // rover past the obstacle) - a wall 1 m to the side made the detour run into it. The keep gap is tried at
+  // obsSideKeepCm, then halfway, then obsMinKeepCm (narrow passages); the first that fits is used for the detour.
+  const float keeps[3] = {obsSideKeepCm, 0.5f * (obsSideKeepCm + obsMinKeepCm), obsMinKeepCm};
+  for (uint8_t j = 0; j < 2; j++) {
+    const int8_t d = j == 0 ? 1 : -1;                              // +1 left
+    const float edge = fmaxf(d > 0 ? -lo : hi, 0.0f);
+    const float corner = edge + hw + obsCornerM;
+    ok[j] = false; keep[j] = obsSideKeepCm; ang[j] = 90; shift[j] = 9;
+    room[j] = _corridor(s, -d * 90.0f, obsHalfWM, 2.0f);
+    if ((d < 0 && L.noRight) || _usSide[j] <= obsMinKeepCm) continue;
+    for (uint8_t k = 0; k < 3 && !ok[j]; k++) {
+      const float sh = edge + hw + keeps[k] / 100.0f + 0.035f * fr;   // + half a 4 deg LiDAR bin
+      if (sh > obsMaxShiftM) continue;
+      // the lane at that offset, body + 5 cm wide, from here to obsLaneLookM past the obstacle face
+      const float look = fr + obsLaneLookM;
+      if (_obsLaneFree(s, rel, d * sh, hw + 0.05f, look) < look - 0.01f) continue;
+      // the diagonal out to it (rover width + 7 cm), steeper in 15 deg steps if the LiDAR shows it blocked
+      float a = _clamp(atan2f(corner, fmaxf(fr - 0.05f, 0.20f)) * RAD_TO_DEG, obsMinDeg, obsMaxDeg);
+      bool free = false;
+      for (; a <= 90.01f; a += 15.0f) {
+        const float sa = sinf(fminf(a, 90.0f) * DEG_TO_RAD), len = sh / sa + 0.40f;
+        if (_corridor(s, -d * fminf(a, 90.0f), hw + 0.07f, len) >= len - 0.01f) { free = true; break; }
+      }
+      if (!free) continue;
+      ok[j] = true; keep[j] = keeps[k]; shift[j] = sh; ang[j] = fminf(a, 90.0f);
+    }
+  }
+  Serial.printf("[route] obstacle %s: face %.2f m, edges %.2f..%.2f | left %s shift %.2f at %.0f deg keep %.0f | right %s shift %.2f at %.0f deg keep %.0f\n",
+                cl ? "(LiDAR)" : "(not in LiDAR, assumed 0.5 m)", fr, lo, hi, ok[0] ? "ok" : "NO", shift[0], ang[0], keep[0],
+                ok[1] ? "ok" : (L.noRight ? "NO (noRight)" : "NO"), shift[1], ang[1], keep[1]);
+  int8_t d = 0;
+  if (!ok[0] && !ok[1]) return 0;
+  if (ok[0] != ok[1]) d = ok[0] ? 1 : -1;
+  else if (fabsf(keep[0] - keep[1]) > 1.0f) d = keep[0] > keep[1] ? 1 : -1;   // the wider gap first
+  else if (fabsf(shift[0] - shift[1]) > 0.10f) d = shift[0] < shift[1] ? 1 : -1;
+  else if (fabsf(ang[0] - ang[1]) > 1.0f) d = ang[0] < ang[1] ? 1 : -1;
+  else d = room[0] >= room[1] ? 1 : -1;
+  const uint8_t jj = d > 0 ? 0 : 1;
+  _avShift = shift[jj]; _avAng = ang[jj]; _keepCm = keep[jj];
+  return d;
+}
+
+void RouteFollow::_obsStart(uint32_t now, bool force, const char* why) {
+  _state = AVOID; _avPhase = curveAvoid ? 40 : 20; _stateMs = now; _l = _r = 0; _lowN = 0; _gapDeviating = false;
+  _obsForce = force; _avMid = false; _usReset = true; _obsRoomDone = false; _obsReplanN = 0; _keepCm = obsSideKeepCm; _obsStallMs = 0;
+  if (why) strlcpy(_msg, why, sizeof(_msg));
+}
+
+// DRIVE, every step: slow down near an obstacle, stop + start the detour at obsStopCm. true = the step is done.
+bool RouteFollow::_obsDetect(const Sensors& s, const Leg& L, uint32_t now, float& vCap) {
+  for (uint8_t k = 0; k < Sensors::kLidarPoints; k++) _scan[k] = s.lidarCm(k);
+  bool agree = false;
+  float f = _obsFrontCmNow(s, &agree, curveAvoid ? lidarSideCm / 100.0f + 0.03f : 0.0f);   // v6: the body strip
+  // v6: curved avoidance may bend the route direction this step (not on a ramp leg, not where the leg ends at a wall)
+  _gapOk = curveAvoid && !((rampLegs >> _i) & 1u) && !(L.end == END_FRONT && _eff >= 0.3f * L.effort);
+  _gapLineYaw = _lineYaw(L, _stepRy);                              // v6: the line to come back to (path / leg direction)
+  // v6: something within 3 cm beside the front half of the 25 cm body (a corner about to touch) -> stop at once,
+  // the backward curve swings the nose away from it (sim: rover 7 curves too wide to steer clear in time)
+  if (curveAvoid && !((rampLegs >> _i) & 1u)) {
+    float near = 9.0f;
+    const float hw = lidarSideCm / 100.0f;
+    for (uint8_t k = 0; k < Sensors::kLidarPoints; k++) {
+      const uint16_t cm = _scan[k];
+      if (cm < 15) continue;
+      const float a = (k * 4.0f + 2.0f) * DEG_TO_RAD, rr = cm / 100.0f, al = rr * cosf(a), lt = rr * sinf(a);
+      if (al < 0 || al > lidarNoseCm / 100.0f + 0.05f) continue;
+      near = fminf(near, fabsf(lt) - hw);
+    }
+    if (near < obsCornerStopM) {
+      _obsStart(now, true, nullptr);
+      snprintf(_msg, sizeof(_msg), "corner %.0f cm from it - stop", near * 100.0f);
+      Serial.printf("[route] obstacle %.0f cm beside the front corner -> stop\n", near * 100.0f);
+      return true;
+    }
+  }
+  // 19.11. (sim, leg 6): on a RAMP leg the flat LiDAR sees the ramp surface at its foot / crest as a wall 2 m wide and
+  // the detour tried to go round the ramp. There only the front ultrasonic starts a detour (the SafetyGuard stays).
+  if ((rampLegs >> _i) & 1u) {
+    const int u0 = s.usCm(0);
+    f = (u0 > 2 && u0 < Sensors::kUsMaxCm) ? (float)u0 : 999.0f;
+    agree = false;
+  }
+  _obsFront = f;
+  const float trig = obsStopCm + obsLeadCm;
+  if (f >= obsSlowCm) { _lowN = 0; return false; }
+  // a leg that ends at a wall ahead ends there (as before)
+  if (L.end == END_FRONT && _eff >= 0.3f * L.effort && f < trig) { _nextLeg(s, "wall ahead reached"); return true; }
+  // a wall of the TAUGHT map (path locked, the LiDAR sees it, nothing new there): the teaching run drove there (corners,
+  // narrow passages) -> the old rule: only closer than lpStopM in the rover-wide corridor
+  const float c = _corridor(s, 0, obsHalfWM, 2.5f);
+  const float lid = c < 2.49f ? c * 100.0f - lidarNoseCm : 999.0f;
+  const int u = s.usCm(0);
+  const float us = (u > 2 && u < Sensors::kUsMaxCm) ? (float)u : 999.0f;
+  if (!((rampLegs >> _i) & 1u) && staticFilter && pathLocked() && lid < 900.0f && lid <= us + 25.0f &&
+      _lp.newPointsAhead(_scan, obsHalfWM, (lid + lidarNoseCm) / 100.0f + 0.20f) < 2) {
+    if (_corridor(s, 0, 0.18f, 1.5f) >= lpStopM) { _lowN = 0; return false; }
+    agree = true; f = 0;                                           // even a mapped wall that close: go round
+  }
+  vCap = obsSlowV;                                                 // approach slowly: a short, exact stop
+  if (f > trig) { _lowN = 0; return false; }
+  if (_lowN < 255) _lowN++;
+  if (!agree && _lowN < 2) return false;                           // one sensor only: 2 scans (false echoes)
+  _obsStart(now, false, nullptr);
+  snprintf(_msg, sizeof(_msg), "obstacle %.0f cm - stop", f);
+  Serial.printf("[route] obstacle ahead: US %d cm, LiDAR %.0f cm -> stop (%.0f cm rule)\n", u, lid, obsStopCm);
+  return true;
+}
+
+// AVOID with simpleAvoid (v5b): 20 stop/choose, 21 turn out, 22 out (diagonal), 23 arc in, 24 pass, 25 return, 29 hold
+void RouteFollow::_avoidSimple(const Sensors& s, const Leg& L, float ry, uint32_t now) {
+  if (_avPhase < 19) { _avPhase = 20; _stateMs = now; }
+  for (uint8_t k = 0; k < Sensors::kLidarPoints; k++) _scan[k] = s.lidarCm(k);
+  if (_usReset) { _obsUsReset(s); _usReset = false; } else _obsUsUpdate(s);   // fresh filter for each detour
+  if (_avPhase >= 21) {                                            // dead-reckoned offset from the line (m, + = left)
+    const float de = (_odo - _avEffPrev) * lmkMPerEff;
+    const float rel = _wrap(ry - _avBase + (de > 0 ? crabDeg : 0.0f)) * DEG_TO_RAD;   // 19.11.: + crab (track off the nose)
+    _avEffPrev = _odo;
+    _avLat += de * sinf(rel);
+    _avS += de * cosf(rel);
+    if (now - _obsT0 > obsMaxMs) { pause("detour too long - help me, then Resume"); return; }
+  }
+  bool agree = false;
+  // 19.11.: passing / going back beside the obstacle ON PURPOSE (narrow gap): "ahead" = the body + 4 cm, not the
+  // 0.20 m strip (sim: the box edge 2 cm inside the strip -> out again, three times, then a pause)
+  const bool beside = _avPhase == 24 || _avPhase == 25;
+  const float f = _obsFrontCmNow(s, &agree, beside ? lidarSideCm / 100.0f + 0.04f : 0.0f);
+  _obsFront = f;
+  const float trig = obsStopCm + obsLeadCm;
+  const int8_t os = (int8_t)-_avDir;                               // side of the obstacle (+1 left)
+  const float v = fminf(_speed, obsSlowV);
+  const float hw = lidarSideCm / 100.0f, keepM = _keepCm / 100.0f;
+  const float crabFix = _outV > 0.1f ? -crabDeg : 0.0f;            // 19.11.: rolling forward the track is crabDeg off the nose   // 19.11.: the gap chosen (corridor mode)
+  const float rel = _wrap(ry - _avBase);                           // + = rover points left of the line direction
+  // offset from the line: the path localiser when it has the path, else dead reckoning (+ = to the detour side)
+  const float off = _avDir * (pathLocked() ? _lp.crossTrack() : _avLat);
+
+  // ---- 29 HOLD: something ahead during the detour
+  if (_avPhase == 29) {
+    _l = _r = 0;
+    if (f > trig + 15.0f) { _avPhase = _obsRet; _stateMs = now; strlcpy(_msg, "detour - free again", sizeof(_msg)); return; }
+    if (now - _obsHoldMs > obsBlockedWaitMs) pause("detour blocked - help me, then Resume");
+    return;
+  }
+  auto hold = [&]() {
+    _obsRet = _avPhase; _avPhase = 29; _obsHoldMs = now; _l = _r = 0;
+    snprintf(_msg, sizeof(_msg), "detour: %.0f cm ahead - waiting", f);
+  };
+
+  // ---- 19 MAKE ROOM (curve-only rovers, 19.11.): reverse STRAIGHT (both wheels backward - no turn on the spot)
+  // until the obstacle face is obsRoomM away, obsRoomBackM reversed, the rear is not free or 6 s. A K-turn right at
+  // the obstacle has no forward room and only 0.6 m of backward allowance (sim: "K-turn - no room" for 45 s).
+  if (_avPhase == 19) {
+    const float face = _corridor(s, 0, obsHalfWM, 2.0f);
+    const float back = (_obsRevOdo - _odo) * lmkMPerEff;
+    if (face >= obsRoomM || back >= _obsRevM || !_rearFree(s) || now - _stateMs > 6000) {
+      _l = _r = 0;
+      if (fabsf(_outV) > 0.02f) return;                            // stand first (soft ramp), then go on
+      Serial.printf("[route] detour: reversed %.2f m for room (face %.2f m)\n", back, face);
+      _avPhase = _obsRevRet; _stateMs = now - (_obsRevRet == 20 ? obsWaitMs : 0);
+      return;
+    }
+    _l = _r = -backupCmd;
+    snprintf(_msg, sizeof(_msg), "detour: reversing for room (%.0f cm)", face * 100.0f);
+    return;
+  }
+  auto reverseFor = [&](uint8_t ret, float m) {
+    _obsRevRet = ret; _obsRevM = m; _obsRevOdo = _odo; _avPhase = 19; _stateMs = now; _l = _r = 0; _obsStallMs = 0;
+  };
+
+  // ---- 20 STOP: stand, wait for people, choose side + angle
+  if (_avPhase == 20) {
+    _l = _r = 0;
+    if (fabsf(_outV) > 0.02f) { _stateMs = now; return; }         // still rolling: the wait starts when it stands
+    if (!_obsForce && f > trig + 15.0f) { _state = DRIVE; _lowN = 0; strlcpy(_msg, "way free again", sizeof(_msg)); return; }
+    if (now - _stateMs < obsWaitMs) { snprintf(_msg, sizeof(_msg), "obstacle %.0f cm - waiting", f); return; }
+    // curve-only: room for the K-turn first (and a flatter angle: the face is further away)
+    if (curveOnly && !_obsRoomDone && _rearFree(s) && _corridor(s, 0, obsHalfWM, 2.0f) < obsRoomM) {
+      _obsRoomDone = true; _obsForce = true;   // after reversing it is further away, not gone: no 'way free again'
+      reverseFor(20, obsRoomBackM); return;
+    }
+    const int8_t dir = _obsChooseSide(s, L);
+    if (dir == 0) {
+      if (_avTries < 1 && _rearFree(s)) {                          // boxed in: back up once and look again
+        _avTries++; _avEff = _eff; _state = BACKUP; _stateMs = now; _climbUntil = 0; _obsResumePh = 0;
+        strlcpy(_msg, "no side free - backing up to look", sizeof(_msg));
+        return;
+      }
+      pause("blocked left and right - help me, Resume");
+      return;
+    }
+    _avDir = dir;
+    _avBase = pathLocked() ? _lineYaw(L, ry) : ry;                 // the line to come back to
+    _avLat = 0; _avS = 0; _avEffPrev = _odo; _obsT0 = now; _obsClrN = 0;
+    _avPhase = 21; _stateMs = now;
+    snprintf(_msg, sizeof(_msg), "obstacle - %.0f deg %s", _avAng, dir > 0 ? "left" : "right");
+    Serial.printf("[route] obstacle %.0f cm: turn %s %.0f deg, shift %.2f m, keep %.0f cm beside it\n", f,
+                  dir > 0 ? "left" : "right", _avAng, _avShift, _keepCm);
+    return;
+  }
+  // ---- 21 TURN OUT (gyro-closed, the normal turn tactics) to the angle chosen from the obstacle's shape
+  if (_avPhase == 21) {
+    const float e = _wrap(_avBase + _avDir * _avAng - ry);
+    if (fabsf(e) < turnDoneDeg && !_pivoting) { _avPhase = 22; _stateMs = now; _obsStallMs = 0; strlcpy(_msg, "detour: out round it", sizeof(_msg)); return; }
+    if (now - _stateMs > obsTurnTimeoutMs) { pause("detour: could not turn - help me, Resume"); return; }
+    _drive(e, _speed, false);
+    return;
+  }
+  // 19.11.: STALL - asking forward but not moving for obsStallMs (the SafetyGuard holds it: it watches a wider / closer
+  // zone than the detour's front check, e.g. a wall corner < 25 cm the LiDAR strip ignores). Sim: 3 min standing.
+  // -> reverse a little and turn out again (steeper), at most obsReplanMax times, then PAUSE.
+  if (_avPhase == 22 || _avPhase == 24 || _avPhase == 25) {
+    // progress = odometry over a window (the stop-start loop asks 0 now and then: a speed test never fires)
+    if (!_obsStallMs) { _obsStallMs = now; _obsStallOdo = _odo; }
+    else if ((_odo - _obsStallOdo) * lmkMPerEff > 0.05f) { _obsStallMs = now; _obsStallOdo = _odo; }
+    if (now - _obsStallMs > obsStallMs) {
+      _obsStallMs = 0;
+      if (_obsReplanN >= obsReplanMax) { pause("detour: held, no progress - help me, Resume"); return; }
+      _obsReplanN++;
+      _avAng = fminf(fmaxf(_avAng, obsMinDeg) + 15.0f, 90.0f); _avPhase = 21; _stateMs = now; _obsClrN = 0;
+      Serial.printf("[route] detour: held %u ms without moving -> back a little, out again at %.0f deg (%u)\n",
+                    (unsigned)obsStallMs, _avAng, _obsReplanN);
+      strlcpy(_msg, "detour: held - out again", sizeof(_msg));
+      if (_rearFree(s)) reverseFor(21, 0.40f);
+      return;
+    }
+  }
+  // ---- 22 OUT: diagonal at _avAng until the LiDAR shows the line direction free for the body + the keep gap
+  if (_avPhase == 22) {
+    if (f <= trig) {                                               // something ahead on the diagonal
+      // 19.11.: which side is it on? OUTER (a wall beyond the detour side, sim leg 1 at 8 m): steeper would drive
+      // into it - the room is used up, turn back to the line direction now if the lane here is free for the body.
+      // INNER (the obstacle's corner): steeper, as before.
+      float bestAl = 9, bestLt = 0;
+      for (uint8_t k = 0; k < Sensors::kLidarPoints; k++) {
+        const uint16_t cm = s.lidarCm(k);
+        if (cm < 15) continue;
+        const float a = (k * 4.0f + 2.0f) * DEG_TO_RAD, rr = cm / 100.0f, al = rr * cosf(a), lt = rr * sinf(a);
+        if (al > 0 && fabsf(lt) < obsHalfWM && al < bestAl) { bestAl = al; bestLt = lt; }   // lt + = right
+      }
+      const bool outer = bestAl < 9 && (_avDir > 0 ? bestLt < 0 : bestLt > 0);
+      if (outer) {
+        const float look = 0.9f;
+        if (_obsLaneFree(s, rel, 0.0f, hw + 0.03f, look) >= look - 0.01f) {   // the body fits here (+3 cm)
+          _obsClrN = 0; _avPhase = 23; _stateMs = now; _arcLat0 = _avLat; _arcAng0 = fabsf(rel);
+          if (_keepCm > obsMinKeepCm) _keepCm = obsMinKeepCm;      // squeezed between obstacle and wall
+          Serial.printf("[route] detour: wall %.0f cm ahead on the outside -> back to the line direction now\n", f);
+          strlcpy(_msg, "detour: wall outside - turning back", sizeof(_msg));
+          return;
+        }
+        Serial.printf("[route] detour: wall %.0f cm ahead on the outside, lane here %.2f m free (base %.1f, rel %.1f, off %.2f) - waiting\n",
+                      f, _obsLaneFree(s, rel, 0.0f, hw + 0.03f, look), _avBase, rel, _avLat);
+        hold(); return;                                            // no room either way: wait, then pause
+      }
+      if (_avAng < 89.0f) {
+        _avAng = fminf(_avAng + 15.0f, 90.0f); _avPhase = 21; _stateMs = now;
+        if (curveOnly && _rearFree(s)) reverseFor(21, 0.30f);    // room for the K-turn first
+        snprintf(_msg, sizeof(_msg), "detour: corner close - %.0f deg", _avAng);
+        Serial.printf("[route] detour: corner %.0f cm ahead -> steeper, %.0f deg\n", f, _avAng);
+        return;
+      }
+      hold(); return;
+    }
+    // the way straight on (line direction): free for body + keep gap -> arc in; free for body + 12 cm and the
+    // offset measured at the stop reached -> arc in as well (the keep then pushes it out a little)
+    // the curve back still drifts out by R (1 - cos angle) and runs R sin(angle) forward (R learned from past
+    // curves): check with the LiDAR the lane the rover will END UP in - body + 35 cm wide, on from there
+    const float ar = fabsf(rel) * DEG_TO_RAD, look = 0.9f + (curveOnly ? 0.3f : _arcR * sinf(ar));
+    // curve-only: the turn back is a K-turn - it ends ~obsKturnLossM nearer the line (sim 19.11.), else a rolling curve
+    const float drift = curveOnly ? -obsKturnLossM : _arcR * (1.0f - cosf(ar)) + 2.0f * 0.25f * obsSlowV * sinf(ar);   // + 2 scans of confirming
+    const float freeKeep = _obsLaneFree(s, rel, _avDir * drift, hw + keepM, look);
+    const float freeMin = _obsLaneFree(s, rel, _avDir * drift, hw + 0.12f, look);
+    if (freeKeep >= look - 0.01f || (freeMin >= look - 0.01f && _avDir * (_avLat + _avDir * drift) >= _avShift)) {
+      if (_obsClrN < 255) _obsClrN++;
+    } else _obsClrN = 0;
+    if (_obsClrN >= 2) {                                           // 2 scans in a row: no single gap in the scan
+      _obsClrN = 0; _avPhase = 23; _stateMs = now; _arcLat0 = _avLat; _arcAng0 = fabsf(rel);
+      strlcpy(_msg, "detour: clear - curving back", sizeof(_msg));
+      Serial.printf("[route] detour: way along the line free (%.2f m off) -> curve back\n", _avLat);
+      return;
+    }
+    if (fabsf(_avLat) > obsMaxShiftM) { pause("obstacle too wide - help me, Resume"); return; }
+    const float sd = _obsSideCmNow(s, os, 0.5f);
+    _obsSide = sd;
+    _drive(_wrap(_avBase + _avDir * _avAng - ry) + crabFix + _obsKeep(sd, os, true), v, true);
+    return;
+  }
+  const bool kTurnPhase = curveOnly && (_avPhase == 23 || _avPhase == 26);   // 19.11.: K-turns check their own room
+  if (f <= trig && !kTurnPhase) {                                  // forward phases: never into something
+    // 19.11.: blocked while passing / going back (often the obstacle itself after the turn back): out again from
+    // here, up to obsReplanMax times - a pause only if that does not help
+    if ((_avPhase == 24 || _avPhase == 25) && _obsReplanN < obsReplanMax) {
+      _obsReplanN++;
+      _avAng = fmaxf(obsMinDeg, 30.0f); _avPhase = 21; _stateMs = now; _obsClrN = 0;
+      Serial.printf("[route] detour: %.0f cm ahead while passing -> out again (%u)\n", f, _obsReplanN);
+      strlcpy(_msg, "detour: blocked - out again", sizeof(_msg));
+      if (curveOnly && _rearFree(s)) reverseFor(21, 0.40f);
+      return;
+    }
+    hold(); return;
+  }
+  // ---- 23 ARC IN: back to the line direction while rolling (no stop, no pivot); too close beside -> straight on
+  if (_avPhase == 23) {
+    const float e = _wrap(_avBase - ry);
+    if (curveOnly) {                                               // 19.11.: K-turn back to the line direction
+      if (fabsf(e) < turnDoneDeg && !_pivoting) {
+        _avPhase = 24; _stateMs = now; _obsStallMs = 0; _obsSeen = false; _obsMissN = 0; _obsClearAt = -1; _obsLeg0 = _avS; _obsClrN = 0;
+        strlcpy(_msg, "detour: passing it", sizeof(_msg)); return;
+      }
+      if (now - _stateMs > obsTurnTimeoutMs) { pause("detour: could not turn - help me, Resume"); return; }
+      _drive(e, _speed, false);
+      return;
+    }
+    if (fabsf(e) < turnDoneDeg) {
+      if (_arcAng0 > 20.0f) {                                      // learn the curve radius (drift / (1 - cos angle))
+        const float rm = _avDir * (_avLat - _arcLat0) / (1.0f - cosf(_arcAng0 * DEG_TO_RAD));
+        _arcR = 0.5f * _arcR + 0.5f * _clamp(rm, 0.2f, 2.0f);
+        Serial.printf("[route] detour: curve drifted %.2f m -> curve radius %.2f m\n", _avDir * (_avLat - _arcLat0), _arcR);
+      }
+      _avPhase = 24; _stateMs = now; _obsStallMs = 0; _obsSeen = false; _obsMissN = 0; _obsClearAt = -1; _obsLeg0 = _avS; _obsClrN = 0;
+      strlcpy(_msg, "detour: passing it", sizeof(_msg)); return; }
+    const float sd = _obsSideCmNow(s, os, 0.5f);
+    _obsSide = sd;
+    float ec = _clamp(e, -obsArcDeg, obsArcDeg);
+    if (sd < _keepCm - 8.0f) ec = _obsKeep(sd, os, true);    // would curve into it: hold the heading, push out
+    _drive(ec, v, true);
+    return;
+  }
+  // ---- 24 PASS: parallel to the line, keep gap to it (LiDAR + filtered ultrasonic) until the LiDAR shows it behind
+  if (_avPhase == 24) {
+    const float sd = _obsSideCmNow(s, os, 0.4f);
+    _obsSide = sd;
+    if (sd < obsSeeCm) _obsSeen = true;
+    // behind = no LiDAR points beside the body (from behind the rear + 15 cm to 0.3 m ahead) within keep + 30 cm,
+    // and the filtered side ultrasonic sees nothing either - 2 scans in a row
+    uint8_t n = 0;
+    _obsLidarSide(s, os, -(lidarRearCm / 100.0f + 0.15f), 0.30f, hw + keepM + 0.30f, &n);
+    const bool beside = n >= 2 || _usSide[os > 0 ? 0 : 1] < obsSeeCm;
+    if (beside) _obsClrN = 0; else if (_obsClrN < 255) _obsClrN++;
+    const float moved = _avS - _obsLeg0;
+    if ((_obsClrN >= 2 && moved > 0.15f) || (!_obsSeen && moved > obsSeeWithinM)) {
+      // return angle: obsBackDeg if the LiDAR shows that diagonal free, else 30 deg, else pass on a little more
+      const float len = fabsf(off) / sinf(obsBackDeg * DEG_TO_RAD) + 0.3f;
+      if (_corridor(s, rel + _avDir * obsBackDeg, hw + 0.05f, len) >= len - 0.01f) _avRet = obsBackDeg;
+      else if (_corridor(s, rel + _avDir * 30.0f, hw + 0.05f, fabsf(off) / 0.5f + 0.3f) >= fabsf(off) / 0.5f + 0.29f) _avRet = 30.0f;
+      else { _drive(_wrap(_avBase - ry) + crabFix + _obsKeep(sd, os, false), v, true); return; }
+      _avPhase = curveOnly ? 26 : 25; _avBackS = _avS; _stateMs = now;
+      strlcpy(_msg, "obstacle passed - back to the path", sizeof(_msg));
+      Serial.printf("[route] obstacle passed (%.2f m off the line) -> back at %.0f deg\n", off, _avRet);
+      return;
+    }
+    _drive(_wrap(_avBase - ry) + crabFix + _obsKeep(sd, os, false), v, true);
+    return;
+  }
+  // ---- 26 TURN IN (curve-only, 19.11.): K-turn to the return heading, then 25 drives straight to the line
+  if (_avPhase == 26) {
+    const float e = _wrap(_avBase - _avDir * _avRet - ry);
+    if (fabsf(e) < turnDoneDeg && !_pivoting) { _avPhase = 25; _stateMs = now; _obsStallMs = 0; return; }
+    if (off <= 0.06f) { _avPhase = 25; _stateMs = now; _obsStallMs = 0; return; }   // the turn pieces already brought it back
+    if (now - _stateMs > obsTurnTimeoutMs) { pause("detour: could not turn - help me, Resume"); return; }
+    _drive(e, _speed, false);
+    return;
+  }
+  // ---- 25 RETURN: curve towards the line, flattening out as the offset goes, so it arrives lined up
+  const float sd = _obsSideCmNow(s, os, 0.3f);
+  _obsSide = sd;
+  if ((off <= 0.06f && (curveOnly || fabsf(_wrap(_avBase - ry)) < 12.0f)) || off <= -0.05f || _avS - _avBackS > 2.0f * obsMaxShiftM + 1.0f) {
+    _state = DRIVE; _passEff = _eff; _peInit = false; _lowN = 0; _avTries = 0;
+    strlcpy(_msg, "obstacle passed - on the path again", sizeof(_msg));
+    Serial.printf("[route] detour done (%.1f m along, %.2f m off)\n", _avS, off);
+    return;
+  }
+  if (curveOnly) {                                                 // straight on the return heading; DRIVE lines it up
+    _drive(_wrap(_avBase - _avDir * _avRet - ry) + crabFix + _obsKeep(sd, os, true), v, true);
+    return;
+  }
+  const float tgt = _avBase - _avDir * _avRet * _clamp(off / 0.30f, 0.0f, 1.0f);
+  _drive(_clamp(_wrap(tgt - ry), -obsArcDeg, obsArcDeg) + _obsKeep(sd, os, true), v, true);
+}
+
+
+// ---- v6 (19.11., Vinay): CURVED AVOIDANCE for the 25 cm box, curve-only - see RouteFollow.h "CURVED AVOIDANCE" ------
+
+// How far (m, from the LiDAR) a strip of half width `half` is free in the direction devDeg off the nose (+ = left),
+// from the last scan (_scan). Within 0.6 m even a single point blocks (a post); further away the 2nd closest point
+// (one stray return does not).
+float RouteFollow::_gapFree(float devDeg, float half, float look) const {
+  float b1 = look, b2 = look;
+  for (uint8_t k = 0; k < Sensors::kLidarPoints; k++) {
+    const uint16_t cm = _scan[k];
+    if (cm < 15) continue;
+    const float a = (-(k * 4.0f + 2.0f) - (devDeg + _gapCrab)) * DEG_TO_RAD, rr = cm / 100.0f;   // CCW from the TRAVEL direction (nose + crab)
+    const float al = rr * cosf(a), lt = rr * sinf(a);
+    if (al <= 0 || al > look || fabsf(lt) >= half) continue;
+    if (al < b1) { b2 = b1; b1 = al; } else if (al < b2) b2 = al;
+  }
+  (void)b2;
+  return b1;   // the closest point: a box 3 m away is only 1-2 LiDAR points (4 deg bins)
+}
+
+// Like _obsLaneFree, on the last scan: 2nd... here the CLOSEST point (m along the lane direction) in a lane of half
+// width `half` parallel to the direction relDeg off the rover's nose... (relDeg = rover nose vs lane direction,
+// + = nose left of it), its centre offM to the left (+). look = free.
+float RouteFollow::_gapLaneFree(float relDeg, float offM, float half, float look) const {
+  // 19.11.: 90 bins of 4 deg leave holes in a wall (at 2 m 14 cm between points) - a lane "fitted" between two wall
+  // points (sim: lane at -0.52 m, inside the wall). Neighbouring points closer than 0.30 m are joined: 3 points between.
+  float b = look;
+  auto test = [&](float al, float lt) {
+    lt -= offM;
+    if (al <= -0.05f || fabsf(lt) >= half) return;
+    if (al < b) b = fmaxf(al, 0.0f);
+  };
+  for (uint8_t k = 0; k < Sensors::kLidarPoints; k++) {
+    const uint16_t cm = _scan[k];
+    if (cm < 15) continue;
+    const float a = (relDeg - (k * 4.0f + 2.0f)) * DEG_TO_RAD, rr = cm / 100.0f;
+    const float al = rr * cosf(a), lt = rr * sinf(a);
+    test(al, lt);
+    const uint8_t k2 = (k + 1) % Sensors::kLidarPoints;
+    const uint16_t cm2 = _scan[k2];
+    if (cm2 < 15) continue;
+    const float a2 = (relDeg - (k2 * 4.0f + 2.0f)) * DEG_TO_RAD, r2 = cm2 / 100.0f;
+    const float al2 = r2 * cosf(a2), lt2 = r2 * sinf(a2);
+    if ((al2 - al) * (al2 - al) + (lt2 - lt) * (lt2 - lt) > 0.09f) continue;
+    for (uint8_t j = 1; j <= 3; j++) test(al + (al2 - al) * j * 0.25f, lt + (lt2 - lt) * j * 0.25f);
+  }
+  return b;
+}
+
+// Centre of the free gap (m sideways of the travel direction relDeg, + = left) nearest to the rover: lane centres
+// every 2 cm, each free for body + 1.5 cm up to `look`; the middle of the free run = the middle of the gap (robust
+// against the 4 deg scan steps, unlike "the first lane that fits": sim, 40 cm gap, it hugged one edge).
+bool RouteFollow::_gapCentre(float relDeg, float look, float& lo) const {
+  const float half = lidarSideCm / 100.0f + 0.015f;
+  const int n = (int)(gapLaneMaxM / 0.02f);
+  float best = 1e9f;
+  int run = -1000;
+  bool found = false;
+  for (int i = -n; i <= n + 1; i++) {
+    const bool fr = i <= n && _gapLaneFree(relDeg, i * 0.02f, half, look) >= look - 0.01f;
+    if (fr && run == -1000) run = i;
+    if (!fr && run != -1000) {
+      const float c = (run + i - 1) * 0.01f;                       // middle of the run (2 cm steps)
+      float score = fabsf(c);
+      if (_gapDevDeg != 0 && c * _gapDevDeg < 0 && fabsf(c) > 0.04f) score += 0.5f;   // keep the side it chose
+      if (score < best) { best = score; lo = c; found = true; }
+      run = -1000;
+    }
+  }
+  return found;
+}
+
+// Free room (m) beside the BODY on side os (+1 left): points from just behind the rear to just past the nose,
+// sideways distance minus the half body. 9 = nothing. Points from 15 cm count (the 25 cm box's corner is ~18 cm from
+// the LiDAR - the old 25 cm cut-off made a post at the corner invisible: sim, 18 bumps).
+float RouteFollow::_gapSide(int8_t os) const {
+  const float hw = lidarSideCm / 100.0f;
+  float best = 9.0f;
+  for (uint8_t k = 0; k < Sensors::kLidarPoints; k++) {
+    const uint16_t cm = _scan[k];
+    if (cm < 15) continue;
+    const float a = (k * 4.0f + 2.0f) * DEG_TO_RAD, rr = cm / 100.0f, al = rr * cosf(a), lt = rr * sinf(a);   // lt + = right
+    const float side = os > 0 ? -lt : lt;
+    if (side <= 0 || al < -(lidarRearCm / 100.0f + 0.05f) || al > lidarNoseCm / 100.0f + 0.15f) continue;
+    best = fminf(best, side - hw);
+  }
+  return best;
+}
+
+// Nearest heading (off the nose, + = left) to e whose strip of half width `half` is free for `need`; it also leans
+// to the side of the last deviation (no flip-flopping between left and right round the same thing).
+bool RouteFollow::_gapPick(float e, float half, float need, float& out) const {
+  float best = 1e9f;
+  bool found = false;
+  for (float d = -gapMaxDevDeg; d <= gapMaxDevDeg + 0.1f; d += 4.0f) {
+    const float cand = e + d;
+    if (fabsf(cand) > gapMaxDevDeg) continue;                      // never more than that off the nose
+    if (_gapFree(cand, half, gapLookM) < need) continue;
+    float cost = fabsf(d);
+    if (_gapDevDeg != 0 && d * _gapDevDeg < 0) cost += 15.0f;     // the other side than before: only if clearly better
+    if (cost < best) { best = cost; out = cand; found = true; }
+  }
+  return found;
+}
+
+// Bends the route direction e (deg off the nose, + = left) round what is ahead; v may be lowered.
+void RouteFollow::_gapSteer(float& e, float& v) {
+  // 19.11.: rolling forward the rover moves crabDeg off its nose (sim -9, rover -7.6): strips and lanes are measured
+  // along where it really GOES, the steering stays in the nose frame
+  _gapCrab = _outV > 0.05f ? crabDeg : 0.0f;
+  const float hw = lidarSideCm / 100.0f;
+  const float half1 = hw + obsSideKeepCm / 100.0f, half2 = hw + gapMarginM;
+  const float need = gapNeedM;
+  // sideways offset from the line while avoiding (legs without the taught path): dead reckoning
+  const float ds = (_odo - _gapOdo) * lmkMPerEff;
+  _gapOdo = _odo;
+  // the TRACK vs the line direction (+ = left of it; rolling forward the track is crabDeg off the nose)
+  // 19.11.: measured against the heading the route asked for when the obstacle was first seen (_gapBaseYaw): rolling
+  // on that heading the rover follows the route, crab included. The leg's line yaw was ~9 deg off it in the sim
+  // (taught nose vs track) -> 0.8 m of false offset after a 5 m corridor and a long wrong "curve back".
+  const float trk = _gapBaseOn ? _wrap(_stepRy - _gapBaseYaw) - (ds > 0 ? 0.0f : crabDeg)
+                               : _wrap(_stepRy - _gapLineYaw + (ds > 0 ? crabDeg : 0.0f));
+  if (_gapDeviating || fabsf(_gapLat) > 0.03f) _gapLat += ds * sinf(trk * DEG_TO_RAD);
+  else { _gapLat = 0; _gapBaseOn = false; }
+  if (pathLocked() && fabsf(_lp.crossTrack()) < 0.10f && !_gapDeviating) _gapLat = 0;   // the path pursuit has it back
+  // only while driving roughly along the route: a big turn onto a new leg is the route's own turn, not an obstacle
+  // (sim leg 3 start: 150 deg "bends")
+  if ((fabsf(e) > gapEngageDeg || _eff < 0.5f) && !_gapDeviating && !_gapRecent(millis())) return;   // + not in a leg's first 0.5 m
+  float want = e;
+  // back to the line only when nothing is in the way along the route (else the pull fights the lane / the bend:
+  // sim, narrow gap: +-22 deg zig-zag)
+  const bool clearAhead = _gapFree(e, half2, gapLookM) >= gapLookM - 0.01f;
+  if (!_gapDeviating && clearAhead && fabsf(_gapLat) > 0.03f && !pathLocked())   // passed, no taught path: steer back to the line
+    want = (_gapBaseOn ? _wrap(_gapBaseYaw - _stepRy) : _wrap(_gapLineYaw - _stepRy) - crabDeg) +
+           _clamp(-gapRetDegPerM * _gapLat, -gapRetMaxDeg, gapRetMaxDeg);
+  // taught path locked: the pursuit aims far ahead and comes back slowly (sim: 1.2 m off for 10 m, then a wall) -
+  // after avoiding, pull back by the localiser's cross-track as well
+  if (!_gapDeviating && clearAhead && pathLocked() && _gapRecent(millis()) && fabsf(_lp.crossTrack()) > 0.10f)
+    want = e + _clamp(-gapRetDegPerM * _lp.crossTrack(), -gapRetMaxDeg, gapRetMaxDeg);
+  // something in the way: bend relative to the ROUTE direction, not to e - the pursuit's e swings back towards the
+  // line as soon as the rover leaves it and dragged the lane bend along (sim, 40 cm gap: e +21 -> it curved into the box)
+  // the reference is the absolute heading the route asked for when the obstacle was first seen (frozen until free)
+  if (!clearAhead || _gapDeviating) {
+    if (!_gapRefOn) {
+      _gapRefOn = true; _gapRefYaw = _wrap(_stepRy + e);
+      if (!_gapBaseOn || fabsf(_gapLat) < 0.03f) { _gapBaseOn = true; _gapBaseYaw = _gapRefYaw; }
+    }
+    const float wr = _wrap(_gapRefYaw - _stepRy);
+    // released as soon as the frozen direction itself is free with the full 35 cm gap and no bend is running (the
+    // obstacle is behind / beside): the route pursuit takes over again (sim, thin pole: frozen parallel 0.5 m off
+    // the path it ran into the map's walls)
+    if (!_gapDeviating && _gapFree(wr, half1, gapLookM) >= need) { _gapRefOn = false; _gapLaneOn = false; }
+    else want = wr;
+  } else { _gapRefOn = false; _gapLaneOn = false; }
+  float out = want;
+  bool dev = false;
+  if (_gapFree(want, half1, gapLookM) < need) {                    // the way on is not free with the 35 cm gap
+    // the thing ahead is part of the TAUGHT map (path locked, nothing new): the teaching run drove there - no bend
+    const float fNear = _gapFree(want, half2, gapLookM);
+    const bool mapped = staticFilter && pathLocked() && fabsf(want) < 20.0f && !_gapLaneOn &&
+                        _lp.newPointsAhead(_scan, half1, fminf(fNear + 0.3f, gapLookM)) == 0;   // far away a box is 1-2 LiDAR points
+    if (!mapped) {
+      float c;
+      float c1 = 0, c2 = 0;
+      const bool w1 = _gapPick(want, half1, need, c1);                                        // round it, 35 cm gap
+      // narrow gap, body + 5 cm: inside a corridor any angled strip meets a wall within 3 m - here the strip only has
+      // to reach past the obstacle (its distance + obsGapPastM)
+      const bool w2 = _gapPick(want, half2, fminf(need, fNear + obsGapPastM), c2);
+      // the 35 cm gap wins only close to the route; a narrow gap ON the route beats a wide detour far off it (sim:
+      // it drove round the outside of a corridor instead of through the 40 cm gap in it)
+      // narrow LANE: a lane parallel to the route, offset sideways, free for body + 5 cm from here to past the
+      // obstacle. A straight strip from the corridor centre cannot thread a 40 cm gap (it clips the box or the wall);
+      // shift sideways into the lane first. Re-measured from the rover every scan -> it eases straight as it lines up.
+      float lo = 0;
+      bool lane = false;
+      if (!(w1 && fabsf(c1 - want) <= gapWideMaxDeg) && fNear < need) {
+        const float look = fNear + obsGapPastM;
+        lane = _gapCentre(-(want + _gapCrab), look, lo);
+        if (lane) _gapLaneOn = true;           // threading a gap: no 'mapped' veto until the way is clear again
+      }
+      if (w1 && fabsf(c1 - want) <= gapWideMaxDeg) { out = c1; dev = fabsf(c1 - want) > 2.0f; }
+      else if (fNear >= need) out = want;                                                      // narrow: straight on fits
+      else if (lane) {
+        // into the lane over the distance left to the obstacle (gentle when far, firmer when near; no overshoot)
+        const float dist = fmaxf(0.6f * (fNear - lidarNoseCm / 100.0f), 0.5f);
+        out = want + _clamp(atan2f(lo, dist) * RAD_TO_DEG, -gapRollMaxDeg, gapRollMaxDeg);
+        dev = true;
+      }
+      else if (w2) { out = c2; dev = fabsf(c2 - want) > 2.0f; }
+      else if (w1) { out = c1; dev = fabsf(c1 - want) > 2.0f; }
+      // nothing free anywhere: a wall across - no bend (leg end / 35 cm stop / SafetyGuard)
+    }
+  }
+  // body-side guard: never curve towards something right beside the body (its corner sweeps that way); too close:
+  // curve away from it
+  {
+    const float cl = _gapSide(1), cr = _gapSide(-1), lim = gapMarginM + 0.03f;
+    // 19.11.: in a gap just wider than the body (40 cm: 7 cm a side) a hard 0 blocked the centring and the heading
+    // crept towards the obstacle (sim: corner on the box) - a gentle 3 deg towards the near side is still allowed
+    if (out > 0 && cl < lim) out = cl < 0.03f ? -8.0f : fminf(out, 3.0f);
+    else if (out < 0 && cr < lim) out = cr < 0.03f ? 8.0f : fmaxf(out, -3.0f);
+    else if (cl < 0.03f && cr >= lim) out = fminf(out, -6.0f);
+    else if (cr < 0.03f && cl >= lim) out = fmaxf(out, 6.0f);
+    if (fabsf(out - want) > 2.0f && !dev) { dev = true; }
+  }
+  if (dev != _gapDeviating) Serial.printf("[route] curve avoid: %s (%.0f deg off the route direction)\n", dev ? "bending round" : "way free", out - want);
+  _gapDeviating = dev;
+  _gapDevDeg = dev ? out - want : 0;
+  // "recently avoiding" (no K-turn back to the path, see _step) only after a REAL bend (> 1 s) or a backward curve
+  if (dev) { if (!_gapDevMs) _gapDevMs = millis(); if (millis() - _gapDevMs > 1000) _gapLastMs = millis(); }
+  else _gapDevMs = 0;
+  const bool back = (fabsf(_gapLat) > 0.03f && !pathLocked()) || (pathLocked() && _gapRecent(millis()) && fabsf(_lp.crossTrack()) > 0.10f);
+  if (dev || back) {
+    e = _clamp(out, -gapRollMaxDeg, gapRollMaxDeg);                // a rolling curve, never a pivot / K-turn
+    v = fminf(v, 0.25f);
+    if (dev || fabsf(_gapLat) > 0.03f)
+      snprintf(_msg, sizeof(_msg), dev ? "curving round (%.0f deg)" : "curving back (%.2f m off)", dev ? _gapDevDeg :
+               (pathLocked() ? _lp.crossTrack() : _gapLat));
+  }
+}
+
+// AVOID with curveAvoid: 40 stop + wait + choose, 41 backward curve, 42 stand -> DRIVE (the curve takes over)
+void RouteFollow::_avoidCurve(const Sensors& s, const Leg& L, float ry, uint32_t now) {
+  (void)ry;
+  for (uint8_t k = 0; k < Sensors::kLidarPoints; k++) _scan[k] = s.lidarCm(k);
+  const float hw = lidarSideCm / 100.0f, half2 = hw + gapMarginM;
+  bool agree = false;
+  const float f = _obsFrontCmNow(s, &agree, hw + 0.03f);
+  _obsFront = f;
+  const float trig = obsStopCm + obsLeadCm;
+  if (_avPhase < 40 || _avPhase > 42) { _avPhase = 40; _stateMs = now; }
+  // ---- 40 STOP: stand, wait for people, choose the side to swing the nose to
+  if (_avPhase == 40) {
+    _l = _r = 0;
+    if (fabsf(_outV) > 0.02f) { _stateMs = now; return; }
+    if (!_obsForce && f > trig + 15.0f) { _state = DRIVE; _lowN = 0; strlcpy(_msg, "way free again", sizeof(_msg)); return; }
+    if (now - _stateMs < obsWaitMs) { snprintf(_msg, sizeof(_msg), "obstacle %.0f cm - waiting", f); return; }
+    if (_eff - _gapRecEff > 2.0f) _gapRec = 0;                       // a new obstacle (2 m driven since the last one)
+    _gapRecEff = _eff;
+    if (++_gapRec > gapRecoverMax) { pause("obstacle: cannot get round - help me, Resume"); return; }
+    // the freest side: the best heading (body + 5 cm) left or right, up to 90 deg
+    float bestL = 0, bestR = 0, dL = 0, dR = 0;
+    for (float d = 12.0f; d <= 90.0f; d += 4.0f) {
+      const float fl = _gapFree(d, half2, gapLookM), fr = _gapFree(-d, half2, gapLookM);
+      if (fl > bestL + 0.05f) { bestL = fl; dL = d; }
+      if (fr > bestR + 0.05f) { bestR = fr; dR = d; }
+    }
+    int8_t dir = bestL >= bestR ? 1 : -1;
+    if (L.noRight) dir = 1;
+    if (_gapDevDeg != 0 && fabsf(bestL - bestR) < 0.3f) dir = _gapDevDeg > 0 ? 1 : -1;   // keep the side it chose
+    // something right beside the body: the backward curve swings the nose AWAY from it (else the corner hits it)
+    const float cl = _gapSide(1), cr = _gapSide(-1);
+    if (fminf(cl, cr) < 0.10f) dir = cl < cr ? -1 : 1;
+    if (!_rearFree(s)) {                                           // no room behind: wait (a person moves on), then pause
+      if (now - _stateMs < 15000) { _gapRec--; snprintf(_msg, sizeof(_msg), "obstacle %.0f cm, no room behind - waiting", f); return; }
+      pause("obstacle close, no room behind - help me"); return;
+    }
+    _gapRevDir = dir; _gapRevOdo = _odo; _avPhase = 41; _stateMs = now;
+    Serial.printf("[route] obstacle %.0f cm: backward curve, nose to the %s (free %.1f m at %.0f deg)\n", f,
+                  dir > 0 ? "left" : "right", dir > 0 ? bestL : bestR, dir > 0 ? dL : dR);
+    snprintf(_msg, sizeof(_msg), "obstacle - backing, nose %s", dir > 0 ? "left" : "right");
+    return;
+  }
+  // ---- 41 BACKWARD CURVE: both wheels backward (never opposite, per-wheel ramp), the nose swings to the free side,
+  // until a heading a forward curve can reach (within gapRollMaxDeg + 10) is free for gapNeedM
+  if (_avPhase == 41) {
+    const float back = (_gapRevOdo - _odo) * lmkMPerEff;
+    bool reach = false;
+    // the NOSE itself (+-8 deg) points into a strip that is free for 1.5 m: a forward curve can take it from there
+    for (float d = -8.0f; d <= 8.1f; d += 4.0f)
+      if (_gapFree(d, half2, 1.5f) >= 1.49f) { reach = true; break; }
+    if ((reach && back > 0.15f) || back >= gapRevMaxM || !_rearFree(s) || now - _stateMs > 9000) {
+      _l = _r = 0; _avPhase = 42; _stateMs = now;
+      Serial.printf("[route] backward curve done: %.2f m back, %s\n", back, reach ? "a way round is free" : "limit reached");
+      return;
+    }
+    if (_gapSide(_gapRevDir) < 0.03f && _gapSide((int8_t)-_gapRevDir) > 0.08f) _gapRevDir = (int8_t)-_gapRevDir;   // corner tight: swing the other way
+    const float o = 0.35f, in = 0.02f;                             // outer / inner wheel (backward; the inner almost stands)
+    if (_gapRevDir > 0) { _l = -o; _r = -in; } else { _l = -in; _r = -o; }   // backward, nose swings to _gapRevDir
+    return;
+  }
+  // ---- 42 STAND, then DRIVE: the curved avoidance bends round it
+  _l = _r = 0;
+  if (fabsf(_outV) > 0.02f) return;
+  _state = DRIVE; _lowN = 0; _gapOdo = _odo; _gapLastMs = now;
+  strlcpy(_msg, "curving round the obstacle", sizeof(_msg));
 }
