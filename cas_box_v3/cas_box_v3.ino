@@ -71,6 +71,7 @@
 #include "Sensors.h"
 #include "DisplayManager.h"
 #include "Countdown.h"       // 18.11.: countdown start (display, web card, double tap, u-blox clock)
+#include "CalibrationManager.h"   // 19.11.: per-box LiDAR angle + start trim in flash
 #include "DriveLog.h"
 #include "SafetyGuard.h"
 #include "GpsNav.h"
@@ -125,6 +126,11 @@ RoverLink rover;      // connection to the rover
 Sensors sensors;      // all box sensors
 DisplayManager disp;  // small OLED on the box
 Countdown countdown;  // 18.11.
+CalibrationManager cal;   // 19.11.
+// 19.11.: lidar.cal estimate (Dev page) - running mean + spread, the "Save LiDAR calibration" button uses them
+float calEst = NAN, calM2 = 0; uint16_t calN = 0;
+volatile uint8_t calReq = 0;   // 1 save LiDAR, 2 reset LiDAR, 3 reset trim (done in loop, not in the web task)
+String calNote = "";
 DriveLog logger;      // drive recording to flash (web card "Drive log")
 SafetyGuard guard;    // emergency stop layer, thresholds in guard.cfg
 GpsNav nav;           // autonomous GPS waypoint mode (web card "Autonomous (GPS)")
@@ -227,6 +233,8 @@ void setup() {
   Serial.begin(115200);
   delay(200);
   Serial.println("[boot] 1 setup start");
+  cal.begin(LIDAR_OFFSET_DEG, ROVER_TRIM_START);   // 19.11.: flash values (defaults = the constants above)
+  cal.print();
 
   // naming scheme, derived from BOX_ID only (see header)
   snprintf(boxSsid, sizeof(boxSsid), "CAS-Box-%02d", BOX_ID);
@@ -262,9 +270,20 @@ void setup() {
   wall.begin(hmi.server());
   mission.begin(hmi.server());
   countdown.begin(hmi.server());   // 18.11.
+  // 19.11.: calibration card + endpoints (the flash is written in loop())
+  hmi.server()->on("/cal.js", HTTP_GET, [](AsyncWebServerRequest* req) { req->send(200, "application/javascript", kCalJs); });
+  hmi.server()->on("/cal/lidar", HTTP_GET, [](AsyncWebServerRequest* req) { calReq = 1; req->send(200, "application/json", "{\"ok\":true}"); });
+  hmi.server()->on("/cal/lidar_reset", HTTP_GET, [](AsyncWebServerRequest* req) { calReq = 2; req->send(200, "application/json", "{\"ok\":true}"); });
+  hmi.server()->on("/cal/trim_reset", HTTP_GET, [](AsyncWebServerRequest* req) { calReq = 3; req->send(200, "application/json", "{\"ok\":true}"); });
+  hmi.server()->on("/cal.json", HTTP_GET, [](AsyncWebServerRequest* req) {
+    const float sd = calN > 1 ? sqrtf(calM2 / (calN - 1)) : 0;
+    String meas = isnan(calEst) ? String("no wall measured") : "measured " + String(calEst + MAP_LIDAR_ERR_DEG, 1) + " deg for our maps, " +
+                  String(calN) + " scans, spread " + String(sd, 1) + " deg";
+    req->send(200, "application/json", "{\"text\":\"" + cal.text() + "\",\"meas\":\"" + meas + "\",\"note\":\"" + calNote + "\"}");
+  });
   // v3 settings
   mission.route.alignStart = START_ALIGN;
-  mission.route.trim = ROVER_TRIM_START;
+  mission.route.trim = cal.trim();   // 19.11.: saved start trim (default ROVER_TRIM_START)
   mission.route.smartAvoid = SMART_OBSTACLES;   // v4
   if (OPEN_SEA_LEG) mission.route.setLandmarkLeg(OPEN_SEA_LEG - 1, kOpenSea, LMK_COUNT(kOpenSea));
   if (BLOCK_I_LEG) mission.route.setLandmarkLeg(BLOCK_I_LEG - 1, kBlockI, LMK_COUNT(kBlockI));
@@ -297,7 +316,7 @@ void setup() {
 
   Serial.println("[boot] 4 log + web ready, starting sensors (LiDAR motor) in 0.5 s");
   delay(500);                        // let the supply recover from the Wi-Fi start first
-  sensors.begin(LIDAR_OFFSET_DEG);
+  sensors.begin(cal.lidarDeg());   // 19.11.: saved LiDAR angle (default LIDAR_OFFSET_DEG)
   Serial.println("[boot] 5 sensors started");
   rover.begin(100);  // sends the current drive command every 100 ms
   Serial.println("[boot] 6 setup done");
@@ -325,6 +344,26 @@ void loop() {
   if (padCurve) { const float d = r > 0 ? 1.0f : -1.0f; l = d > 0 ? 0.05f : PIVOT_CMD; r = d > 0 ? PIVOT_CMD : 0.05f; }
 
   // Full-auto mission (heartbeat from the page) - otherwise manual driving from the pad.
+  // 19.11.: calibration requests from the page (never during a mission) + trim saved after a mission
+  if (calReq && !mission.active()) {
+    const uint8_t q = calReq; calReq = 0;
+    if (q == 1) {
+      const float sd = calN > 1 ? sqrtf(calM2 / (calN - 1)) : 99;
+      if (!isnan(calEst) && calN >= 20 && sd <= 1.0f) {
+        const int v = (int)lroundf(calEst + MAP_LIDAR_ERR_DEG);
+        calNote = cal.saveLidar(v) ? "LiDAR " + String(v) + " deg saved - restart the box to use it" : String("LiDAR save failed");
+      } else calNote = "not saved: needs 20 scans of a wall within 1 deg (now " + String(calN) + ", spread " + String(sd, 1) + ")";
+    } else if (q == 2) { cal.resetLidar(); calNote = "LiDAR back to default - restart the box"; }
+    else if (q == 3) { cal.resetTrim(); mission.route.trim = cal.trim(); calNote = "trim back to default"; }
+    Serial.println("[cal] " + calNote);
+  } else if (calReq && mission.active()) { calReq = 0; calNote = "rejected: mission running"; }
+  {
+    static bool was = false; static float trimS0 = 0;
+    const bool act = mission.active();
+    if (act && !was) trimS0 = mission.route.trimLearnSeconds();
+    if (!act && was) { calNote = "trim " + cal.saveLearnedTrim(mission.route.trim, mission.route.trimLearnSeconds() - trimS0); Serial.println("[cal] " + calNote); }
+    was = act;
+  }
   // 18.11.: countdown at 0 s -> whole route (the start pose is found by the start alignment)
   if (countdown.poll(sensors) && !mission.active()) mission.requestRoute(countdown.speed);
   mission.pollRequests(sensors, wall, nav);
@@ -338,7 +377,7 @@ void loop() {
   guard.cfg.lidarStopCm = mission.route.onRamp() ? 0 : 30;
   // log_018: at the ramp foot the front ultrasonic read 9-23 cm (the ramp surface) -> stop / kick /
   // stop. On ramp legs it stops only for something really close.
-  guard.cfg.frontStopCm = mission.route.onRamp() ? 10 : 25;
+  guard.cfg.frontStopCm = mission.route.onRamp() ? 10 : 50;   // 19.11.: 50 cm (was 25)
   safetyReason = USE_SAFETY_GUARD ? guard.apply(sensors, l, r) : (uint8_t)SafetyGuard::OK;
 
   // make small commands move the rover (dead band, pivot minimum, breakaway kick); no kick while
@@ -420,7 +459,6 @@ void loop() {
     // v3 LiDAR calibration: a long straight wall left / right of a rover standing PARALLEL to it. Foot of the wall
     // should be +90 (left) / -90 (right); true offset = LIDAR_OFFSET_DEG + (foot - expected). Averaged over scans.
     {
-      static float calEst = NAN; static uint16_t calN = 0;
       uint16_t sc[Sensors::kLidarPoints];
       for (uint8_t k = 0; k < Sensors::kLidarPoints; k++) sc[k] = sensors.lidarCm(k);
       LineFeat::Cfg cc; cc.rMax = 4.0f; cc.minLen = 1.5f; cc.footTol = 25; cc.halfDeg = 50;
@@ -429,9 +467,9 @@ void loop() {
       const LineFeat::Line& w = (wl.ok && (!wr.ok || wl.len >= wr.len)) ? wl : wr;
       String t = "no straight wall within 4 m";
       if (w.ok) {
-        const float est = LIDAR_OFFSET_DEG + LineFeat::wrap180(w.foot - (&w == &wl ? 90.0f : -90.0f));
-        if (isnan(calEst) || fabsf(est - calEst) > 5.0f) { calEst = est; calN = 1; }
-        else { calN = calN < 40 ? calN + 1 : 40; calEst += (est - calEst) / calN; }
+        const float est = cal.lidarDeg() + LineFeat::wrap180(w.foot - (&w == &wl ? 90.0f : -90.0f));   // 19.11.: the angle in use
+        if (isnan(calEst) || fabsf(est - calEst) > 5.0f) { calEst = est; calN = 1; calM2 = 0; }
+        else if (calN < 40) { calN++; const float d0 = est - calEst; calEst += d0 / calN; calM2 += d0 * (est - calEst); }   // Welford
         t = String(&w == &wl ? "left" : "right") + " wall " + String(w.d, 2) + " m, " + String(w.len, 1) + " m long: true offset " +
             String(calEst, 1) + " -> for our maps " + String(calEst + MAP_LIDAR_ERR_DEG, 0) + " (" + String(calN) + " scans)";
       }

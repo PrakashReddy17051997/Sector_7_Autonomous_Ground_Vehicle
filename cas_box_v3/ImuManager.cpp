@@ -55,13 +55,28 @@ void ImuManager::update() {
                   (health[0] >> 6) & 3, (health[0] >> 4) & 3, (health[0] >> 2) & 3, health[0] & 3,
                   (unsigned long)_bad);
   }
-  if (!_sampleValid) { _bad++; return; }   // keep the last good values
+  if (!_sampleValid) {
+    _bad++;   // keep the last good values
+    // 19.11.: stuck invalid (reset by a knock / supply dip, I2C error) -> start the chip again, keep the yaw
+    if (_lastUpdateMs != 0 && now - _lastUpdateMs > 1500 && now - _reinitMs > 5000) {
+      _reinitMs = now; _reinits++;
+      if (_zeroSet) { _keepYawDeg = yawDeg(); _keepYaw = true; }
+      Serial.printf("[imu] no valid sample for %lu ms (status %u, error %u, mode %u) -> restart BNO055 (#%lu)\n",
+                    (unsigned long)(now - _lastUpdateMs), health[4], health[5], health[8], (unsigned long)_reinits);
+      if (bno.begin(OPERATION_MODE_IMUPLUS)) { bno.setExtCrystalUse(true); _zeroSet = false; }
+    }
+    return;
+  }
 
   // Euler angles from the fusion, sensor frame: x = heading (clockwise), y = roll, z = pitch
   const float sensorRoll = (int16_t)(angles[2] | (angles[3] << 8)) / 16.0f;
   const float sensorPitch = (int16_t)(angles[4] | (angles[5] << 8)) / 16.0f;
   _fusionYawDeg = wrap180((int16_t)(angles[0] | (angles[1] << 8)) / 16.0f);
-  if (!_zeroSet) { _zeroDeg = _fusionYawDeg; _zeroSet = true; }
+  if (!_zeroSet) {
+    // yawDeg() = -(fusion - zero): after a restart the zero is set so the yaw goes on from where it was
+    _zeroDeg = _keepYaw ? wrap180(_fusionYawDeg + _keepYawDeg) : _fusionYawDeg;
+    _keepYaw = false; _zeroSet = true;
+  }
 
   // sensor frame -> vehicle frame (ISO 8855), see header: sensor turned by 90 deg
   _pitchDeg = -sensorRoll;   // front down = sensor roll negative  -> ISO pitch positive

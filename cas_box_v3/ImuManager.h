@@ -35,7 +35,8 @@ public:
   bool headingReady() const { return _ready && _sampleValid && _lastUpdateMs != 0 && millis() - _lastUpdateMs <= 500; }
   float pitchDeg() const { return _pitchDeg; }  // ISO pitch, + = front down
   float rollDeg() const { return _rollDeg; }    // ISO roll, + = right side down
-  uint32_t badSamples() const { return _bad; }  // rejected reads since start (Dev view / log check)
+  uint32_t badSamples() const { return _bad; }
+  uint32_t reinits() const { return _reinits; }   // 19.11.: automatic restarts of the BNO055  // rejected reads since start (Dev view / log check)
 
   // ---- v3 (2026-11-10): DOUBLE TAP on the box + IMU recording ---------------------------------
   // Linear acceleration (gravity removed by the BNO055 fusion, register 0x28, 1 m/s^2 = 100 LSB) is read
@@ -62,6 +63,9 @@ private:
   bool _ready = false;
   bool _sampleValid = false;
   uint32_t _lastAttemptMs = 0, _lastUpdateMs = 0, _bad = 0;
+  // 19.11. (logs 043/046: the BNO055 stopped giving valid samples for 41-70 s, the rover stood): no valid sample
+  // for 1.5 s -> the chip is started again (max every 5 s); the yaw goes on from its last value
+  uint32_t _reinitMs = 0, _reinits = 0; bool _keepYaw = false; float _keepYawDeg = 0;
   float _fusionYawDeg = 0;                      // sensor frame: heading clockwise
   float _pitchDeg = 0, _rollDeg = 0;            // vehicle frame (ISO 8855)
   bool _zeroSet = false;

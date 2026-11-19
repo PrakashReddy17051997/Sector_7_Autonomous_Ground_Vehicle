@@ -51,6 +51,7 @@ setInterval(()=>{if(running&&!document.hidden)fetch('/mission/alive',{cache:'no-
 setInterval(st,1000);st();
 const rm=document.createElement('script');rm.src='/routemap.js';document.body.appendChild(rm);  // Route map card
 const cd=document.createElement('script');cd.src='/countdown.js';document.body.appendChild(cd);  // 18.11.: Countdown card
+const cl=document.createElement('script');cl.src='/cal.js';document.body.appendChild(cl);  // 19.11.: Calibration card
 })();)rawjs";
 
 // ---------------------------------------------------------------------------------------------

@@ -199,7 +199,7 @@ public:
                               // log_028: 0.45 did not turn it at the ramp foot, the teacher turned there at 0.50)
   uint32_t swingAfterMs = 4500;   // pivot at full boost and still not turning -> SWING turn: inner wheels stop,
                                   // outer wheels drive (log_028 ramp foot: pivot on the spot did not turn at all)
-  float usStopCm = 20;        // front ULTRASONIC this close in 2 scans in a row -> obstacle handling (06.11.)
+  float usStopCm = 50;        // front ULTRASONIC this close in 2 scans in a row -> obstacle handling (06.11.; 19.11.: 50, was 20)
   uint8_t stuckWindows = 3;   // scene unchanged in this many 2 s windows in a row -> back up (was 2)
   uint8_t boostAfterSteps = 8;  // no progress for 2 s while rolling -> gentle push (was 0.75 s)
   // arcMax = 0 -> no arcs at all: pivots only (if the field test shows arcs stall this rover)
@@ -221,6 +221,7 @@ public:
   bool trimLearn = true;
   float trimTauS = 15.0f, trimTauFastS = 6.0f, trimMax = 0.60f, trimLearnBelowDeg = 6.0f;
   float driveSeconds() const { return _driveS; }
+  float trimLearnSeconds() const { return _trimS; }   // 19.11.: seconds the trim was learned (since boot)
   // TURN TACTICS (v3, 11.11. after log_030 - see RouteFollow.cpp): pivot full power, swing, shift, arc in a cycle
   bool turnTactics = true;            // false = the old soft pivot 0.35 -> 0.50 + swing
   float turnCmd = 0.50f;              // wheel command of swing / arc, and of the pivot when 0.35 does not turn it
@@ -480,12 +481,14 @@ private:
   // v3
   float _alignDeg = 0, _alignSc = 0, _alignSec = 0;
   float _driveS = 0;
+  float _trimS = 0;   // 19.11.
   // v3 turn tactics + start turn
   enum Tac : uint8_t { TK_NONE = 0, TK_PIVOT = 1, TK_SWING = 2, TK_SHIFT = 3, TK_ARC = 4, TK_REST = 5, TK_ROLL = 6, TK_KTURN = 7 };
   uint8_t _tk = TK_NONE, _tkNext = 0, _tkCycles = 0, _floorH = 0;
   uint32_t _tkMs = 0, _tkWinMs = 0, _settleMs = 0;
   float _tkYaw = 0, _shiftM = 0, _netM = 0, _stepTgt = NAN;
   uint32_t _dropMs = 0;
+  uint8_t _usN = 0; int _usFirst = 0;   // 19.11.: front ultrasonic plausibility (rain)
   bool _vetoLogged = false;
   float _settleYaw = 0;
   bool _shiftBack = false, _floorOk = false, _startTurn = false, _tkBoosted = false;

@@ -338,6 +338,7 @@ void RouteFollow::_control(const Sensors& s) {
     const float nt = _clamp(trim + (_hc / base) * dt / tau, -trimMax, trimMax);
     _hc -= (nt - trim) * base;
     trim = nt;
+    _trimS += dt;   // 19.11.: learning time (CalibrationManager saves the trim only after enough)
   }
   if (base > 0.1f && dt > 0 && dt < 0.1f) _driveS += dt;
   _l = base - _hc - base * trim;            // trim: + = more on the right wheel (turns left), like Arjun's RoverTrim
@@ -652,7 +653,16 @@ void RouteFollow::_step(const Sensors& s, const WallFollow& wf) {
       // 06.11. (log_028 pole): the front ultrasonic is an obstacle sensor too - the LiDAR misses thin
       // things close up (< 25 cm). Not on the slope (it sees the ramp surface there).
       const int usf = s.usCm(0);
-      if (!ramp && usf > 2 && usf < usStopCm) blocked = true;
+      // 19.11. (log_043, rain): the front ultrasonic read 16 cm while the LiDAR saw > 4 m free -> false obstacle.
+      // It counts when the LiDAR front (+-30 deg) also sees something within usf + 40 cm, or when the reading keeps
+      // coming closer while driving (a thin thing the LiDAR misses: 4 scans, >= 4 cm closer) - a wet sensor stays put.
+      if (!ramp && usf > 2 && usf < usStopCm) {
+        uint16_t lf = 0xFFFF;
+        for (int8_t k = -8; k <= 7; k++) { const uint16_t cm = s.lidarCm((uint8_t)((k + 90) % 90)); if (cm > 15 && cm < lf) lf = cm; }
+        if (_usN == 0) _usFirst = usf;
+        if (_usN < 255) _usN++;
+        if ((lf != 0xFFFF && lf < (uint16_t)(usf + 40)) || (_usN >= 4 && _usFirst - usf >= 4)) blocked = true;
+      } else _usN = 0;
       // v4: a NEW thing (not in the leg map) on the locked path counts from avoidPlanM (1.5 m), not only inside
       // hardStopM - with the 2 s S-curve stop the rover rolled ~0.3 m into it (obstacle_sim scenario 1)
       // (only with a reliable match: with a weak one mapped walls land beside their cells and look new -
@@ -913,7 +923,13 @@ bool RouteFollow::_rearFree(const Sensors& s) const {
   // a 0.3 m back shift needs ~0.55 m (log_031: the operator stood 0.7 m behind -> 0.8 m blocked every back shift)
   for (uint8_t i = 37; i <= 52; i++) { const uint16_t cm = s.lidarCm(i); if (cm > 25 && cm < 55) return false; }
   const int b = s.usCm(3);
-  return !(b > 2 && b < 40);
+  if (!(b > 2 && b < 40)) return true;
+  // 19.11. (logs 043-047, rain + umbrella): the back ultrasonic read a constant 1-9 cm while the LiDAR saw 1.1-1.7 m
+  // free behind -> every backward K-turn piece was blocked and the start turn waited for ever. It only counts when
+  // the LiDAR rear (160-200 deg) has no data or also sees something within b + 30 cm (as SafetyGuard BACK_US).
+  uint16_t lr = 0xFFFF;
+  for (uint8_t i = 40; i <= 50; i++) { const uint16_t cm = s.lidarCm(i); if (cm > 15 && cm < lr) lr = cm; }
+  return !(lr == 0xFFFF || lr < (uint16_t)(b + 30));
 }
 
 // K-turn room: forward = corridor ahead (rover-wide) longer than 0.45 m, floor seen, within the forward limit;

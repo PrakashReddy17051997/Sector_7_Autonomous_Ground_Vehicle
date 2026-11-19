@@ -22,18 +22,19 @@
 
 class SafetyGuard {
 public:
-  enum Reason : uint8_t { OK = 0, TILT = 1, FRONT_US = 2, FRONT_ANGLED = 3, FRONT_LIDAR = 4, BACK_US = 5 };
+  enum Reason : uint8_t { OK = 0, TILT = 1, FRONT_US = 2, FRONT_ANGLED = 3, FRONT_LIDAR = 4, BACK_US = 5, SIDE_US = 6 };
 
   struct Config {
     float maxRollDeg = 12, maxPitchDeg = 15;  // stop above these
     float levelDeg = 8;                       // released again below this (both axes)
     float tiltReverseMax = 0.15f;             // allowed reverse speed while tilted
-    int frontStopCm = 25;                     // front ultrasonic
+    int frontStopCm = 50;                     // front ultrasonic (19.11.: was 25)
     bool useFrontAngled = true;               // see NOTE above
     int angledStopCm = 25;                    // front-angled ultrasonic
     int lidarStopCm = 30;                     // LiDAR in the front sector
     int lidarHalfAngleDeg = 20;               // front sector = +-20 deg
     int backStopCm = 20;                      // back ultrasonic
+    int sideStopCm = 15;                      // 19.11.: left / right ultrasonic (driving forward)
   };
 
   Config cfg;
@@ -60,9 +61,11 @@ public:
       // the front ultrasonic stops only if the LiDAR front agrees (< frontStop + 30 cm) or 300 ms in a row
       const bool usNear = _valid(s.usCm(0)) && s.usCm(0) < cfg.frontStopCm;
       if (!usNear) _usMs = 0; else if (_usMs == 0) _usMs = millis() | 1u;
-      if (usNear && (millis() - _usMs >= 300 || _lidarFrontMinCm(s) < (uint16_t)(cfg.frontStopCm + 30))) why = FRONT_US;
+      // 19.11. (rain, log_043: a wet sensor read 16 cm for seconds): alone it must hold 1 s (was 300 ms)
+      if (usNear && (millis() - _usMs >= 1000 || _lidarFrontMinCm(s) < (uint16_t)(cfg.frontStopCm + 30))) why = FRONT_US;
       else if (cfg.useFrontAngled && _valid(s.usCm(4)) && s.usCm(4) < cfg.angledStopCm) why = FRONT_ANGLED;
       else if (_lidarFrontMinCm(s) < cfg.lidarStopCm) why = FRONT_LIDAR;
+      else if (_sideNear(s, 1) || _sideNear(s, 2)) why = SIDE_US;   // 19.11.
       if (why != OK) v = 0;
     } else if (v < 0) {
       // 06.11. (log_026-028: the back ultrasonic reads a constant 16 cm, the LiDAR sees nothing behind for
@@ -86,6 +89,7 @@ public:
       case FRONT_ANGLED: return "STOP: front-angled ultrasonic";
       case FRONT_LIDAR: return "STOP: LiDAR front";
       case BACK_US: return "STOP: back ultrasonic";
+      case SIDE_US: return "STOP: side ultrasonic";
       default: return "?";
     }
   }
@@ -106,6 +110,18 @@ private:
       if (cm && cm < best) best = cm;
     }
     return best;
+  }
+
+  // 19.11.: left (us 1) / right (us 2) ultrasonic closer than sideStopCm - counts only if the LiDAR on that side
+  // (90 / 270 +- 24 deg) has no data or also sees something within sideStopCm + 25 cm (rain: wet sensors)
+  bool _sideNear(const Sensors& s, uint8_t us) const {
+    const int u = s.usCm(us);
+    if (!_valid(u) || u >= cfg.sideStopCm) return false;
+    if (!s.lidarOk()) return true;
+    const int c = us == 1 ? 270 : 90;   // LiDAR bins run clockwise from the front: left = 270 deg
+    uint16_t best = 0xFFFF;
+    for (int a = c - 24; a < c + 24; a += 4) { const uint16_t cm = s.lidarCm((uint8_t)(a / 4)); if (cm && cm < best) best = cm; }
+    return best == 0xFFFF || best < (uint16_t)(cfg.sideStopCm + 25);
   }
 
   // closest LiDAR return behind (180 +- 28 deg); 0xFFFF if nothing seen / no LiDAR
