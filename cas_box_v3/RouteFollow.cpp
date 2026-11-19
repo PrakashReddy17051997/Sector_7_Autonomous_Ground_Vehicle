@@ -847,7 +847,7 @@ void RouteFollow::_lmkBegin() {
 bool RouteFollow::_lmkDrive(const Sensors& s, float ry, float v) {
   const Leg& L = _cur();
   // where on the leg: the locked localizer (scaled to the table's metres) beats effort (log_031: effort 40 % ahead)
-  const bool lpOk = _lpOn && pathLocked() && _lp.leg() == _i && _lp.sEnd() > 0.5f;
+  const bool lpOk = _lpOn && pathLocked() && _lp.leg() == _i && _lp.sEnd() > 0.5f && !((lmkOdoLegs >> _i) & 1u);   // 19.11.
   const float sM = (lpOk && _lmkLen > 0) ? _lp.s() * _lmkLen / _lp.sEnd() : legMetres();
   const bool tilted = fabsf(s.pitchDeg() - _pitch0) > lmkTiltDeg;
   // 12.11. (log_033, M51-M57): the pitch gate held EVERY phase on the ramp -> no left-wall steering, the rover went

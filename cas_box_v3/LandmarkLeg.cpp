@@ -3,10 +3,10 @@
 using LineFeat::wrap180;
 
 const char* LandmarkLeg::typeName() const {
-  static const char* kNames[] = {"hold", "anchor", "side PID", "edge", "corridor", "entrance", "stop wall", "center"};
+  static const char* kNames[] = {"hold", "anchor", "side PID", "edge", "corridor", "entrance", "stop wall", "center", "pole"};
   if (!_ph || _p >= _n) return "end";
   const uint8_t t = _ph[_p].type;
-  return t <= CENTER ? kNames[t] : "?";
+  return t <= POLE ? kNames[t] : "?";
 }
 
 LineFeat::Line LandmarkLeg::_line(const uint16_t* scan, float footExp, float dMin, float dMax, float minLen) const {
@@ -105,6 +105,27 @@ LandmarkLeg::Out LandmarkLeg::step(const uint16_t* scan, float ry, float ref, fl
       return o;
     }
 
+    case POLE: {
+      // 19.11.: pass a thin pole on the footExp side at dRef, then the phase ends (see LandmarkLeg.h, POLE)
+      const float side = P.footExp >= 0 ? 1.0f : -1.0f;
+      const float course = wrap180(ref + P.lineOff);
+      float px = 0, py = 0;
+      const bool seen = _poleFind(scan, side, P.dMax, P.a, P.b, px, py);
+      o.yawDes = course;
+      if (!seen) { o.why = _hitN ? "pole: lost" : "pole: looking"; return o; }
+      if (_hitN < 255) _hitN++;
+      _lastD = py; o.line = true;
+      if (_hitN >= 2 && px <= P.c) { _p++; _resetPhase(); o.why = "pole passed"; if (_p >= _n) { _done = true; o.done = true; } return o; }
+      if (px > 0.3f) {                                     // still ahead: steer so it passes at dRef on its side
+        const float e = side * py - P.dRef;                // + = further out than wanted
+        _turn = _clamp(P.kp * e, -P.satDeg, P.satDeg);
+        o.yawDes = wrap180(course + side * _turn);
+        _lastE = e;
+      }
+      o.why = "pole ahead";
+      return o;
+    }
+
     case CENTER: {
       // left line = this phase's line (footExp +90, dRef = taught left distance), right line looked up here
       // (taught right distance in a). Both: middle of the corridor; one: keep its taught distance; none: hold.
@@ -162,4 +183,37 @@ LandmarkLeg::Out LandmarkLeg::step(const uint16_t* scan, float ry, float ref, fl
     }
   }
   return o;
+}
+
+// 19.11.: nearest pole-like cluster (thin, free-standing) 0.2-3 m ahead (x) and within dMax sideways (y, + = left).
+// Scan bins are 4 deg (LineFeat::binDegCcw); a cluster = neighbouring bins whose ranges differ < 0.12 m.
+bool LandmarkLeg::_poleFind(const uint16_t* scan, float side, float dMax, float wMax, float iso, float& px, float& py) const {
+  (void)side;
+  const int N = LineFeat::kN;
+  float best = 99;
+  bool found = false;
+  int i = 0;
+  while (i < N) {
+    const float r0 = scan[i] / 100.0f;
+    if (r0 < 0.15f || r0 > 3.5f) { i++; continue; }
+    int j = i;
+    while (j + 1 < N) { const float r1 = scan[j + 1] / 100.0f; if (r1 < 0.15f || fabsf(r1 - scan[j] / 100.0f) > 0.12f) break; j++; }
+    // cluster i..j: ends (points) and centre
+    const float ai = LineFeat::binDegCcw(i) * 0.017453f, aj = LineFeat::binDegCcw(j) * 0.017453f;
+    const float ri = scan[i] / 100.0f, rj = scan[j] / 100.0f;
+    const float xi = ri * cosf(ai), yi = ri * sinf(ai), xj = rj * cosf(aj), yj = rj * sinf(aj);
+    const float w = sqrtf((xi - xj) * (xi - xj) + (yi - yj) * (yi - yj));
+    const float rm = 0.5f * (ri + rj);
+    // free-standing: the bins just outside the cluster see nothing, or something at least iso further away
+    const int a = (i + N - 1) % N, b = (j + 1) % N;
+    const float ra = scan[a] / 100.0f, rb = scan[b] / 100.0f;
+    const bool freeA = ra < 0.15f || ra > rm + iso, freeB = rb < 0.15f || rb > rm + iso;
+    const float cx = 0.5f * (xi + xj), cy = 0.5f * (yi + yj);
+    if (w <= wMax && freeA && freeB && cx >= -0.8f && cx <= 3.0f && fabsf(cy) <= dMax) {
+      const float d = sqrtf(cx * cx + cy * cy);
+      if (d < best) { best = d; px = cx; py = cy; found = true; }
+    }
+    i = j + 1;
+  }
+  return found;
 }

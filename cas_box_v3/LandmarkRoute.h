@@ -70,15 +70,20 @@ static const LmkPhase kLeg7[] = {
   {LandmarkLeg::SIDE, 90, 0.0f, 2.8f, 0.80f, 0.30f, 3.30f, 10, 1.5f, 20, 15, 10, 1.0f, 0.05f, 0, 0, 0, 0, 0.3f},  // 13.11.: ramp end M55-M57 - left wall at 0.8 m (taught 2.47 m)
 };
 // leg 8 (M57-M60), taught 8.0 m, ref -99.2 deg
-// 19.11. (log_042): legs 8-9 HOLD THE IMU HEADING - the localizer jumped 4 m ahead (false match) and ended legs 8-9
-// after 3.2 / 1.9 m, so the leg-10 right turn came at M59 instead of M61. No wall rows (log_038: 50-78 deg off).
+// 19.11. (field test 19.11.): after ramp 3 the rover must pass the POLE at M59 on its LEFT at ~0.5 m, then drive
+// straight to the leg-10 wall (M61). With the left-wall rows (1.2 m) it passed the pole on the wrong side, followed a
+// wall and hit the kerb. Leg 8 = POLE phase: course ref - 10 deg (simulator: the bare ref drifts ~10 deg left of the
+// taught line), pole ahead -> keep it 0.5 m on the left (20 deg/m, max 15), leg ends when the pole is beside the
+// LiDAR; not seen within 5 m -> ends on distance. Odometry only (RouteFollow::lmkOdoLegs, log_042 localizer jumps).
 static const LmkPhase kLeg8[] = {
-  {LandmarkLeg::SIDE, 90, 0.0f, 8.0f, 50.0f, 49.0f, 49.5f, 0, 0, 0, 0, 0, 99.0f, 0.0f, 0, 0, 0, 0, 0.0f},  // 19.11. HEADING ONLY (never a line)
+  {LandmarkLeg::POLE, 90, 0.3f, 5.0f, 0.50f, 0, 1.30f, 20, 0, 0, 15, 0, 0, 0.0f, 0.35f, 0, 0.30f, 0.0f, -10.0f},  // pole on the left at 0.5 m
 };
 // leg 9 (M60-M61), taught 4.2 m, ref -112.9 deg
+// 19.11.: leg 9 = from the pole (M59) STRAIGHT to the leg-10 wall (M61, ~7-8 m): IMU heading only (ref -112.9 =
+// the M59-M61 direction), the wall ahead at 2.43 m ends it. Odometry only (lmkOdoLegs: no localizer jump ends it).
 static const LmkPhase kLeg9[] = {
-  {LandmarkLeg::SIDE, 90, 0.0f, 2.2f, 50.0f, 49.0f, 49.5f, 0, 0, 0, 0, 0, 99.0f, 0.0f, 0, 0, 0, 0, 0.0f},  // 19.11. HEADING ONLY (never a line)
-  {LandmarkLeg::STOP, 0, 2.2f, 7.2f, 2.43f, 0.8f, 6.0f, 0, 0, 0, 0, 12, 1.5f, 0.0f, 0, 0, 0, 0, 18.8f},  // wall ahead, taught end 2.43 m (19.11.: anchor 0 - only ends the leg)
+  {LandmarkLeg::SIDE, 90, 0.0f, 3.0f, 50.0f, 49.0f, 49.5f, 0, 0, 0, 0, 0, 99.0f, 0.0f, 0, 0, 0, 0, 0.0f},  // HEADING ONLY (never a line)
+  {LandmarkLeg::STOP, 0, 3.0f, 10.0f, 2.43f, 0.8f, 6.0f, 0, 0, 0, 0, 12, 1.5f, 0.0f, 0, 0, 0, 0, 18.8f},  // wall ahead, taught end 2.43 m (anchor 0)
 };
 // leg 10 (M61-M63), taught 6.7 m, ref -183.0 deg
 static const LmkPhase kLeg10[] = {
@@ -115,7 +120,7 @@ static const LmkLegReg kLmkLegs[] = {
   {6, kLeg6, LMK_COUNT(kLeg6), 23.2f},
   {7, kLeg7, LMK_COUNT(kLeg7), 2.8f},
   {8, kLeg8, LMK_COUNT(kLeg8), 8.0f},
-  {9, kLeg9, LMK_COUNT(kLeg9), 4.2f},
+  {9, kLeg9, LMK_COUNT(kLeg9), 8.0f},   // 19.11.: from the pole, was 4.2
   {10, kLeg10, LMK_COUNT(kLeg10), 6.7f},
   {11, kLeg11, LMK_COUNT(kLeg11), 2.2f},
   {12, kLeg12, LMK_COUNT(kLeg12), 4.9f},

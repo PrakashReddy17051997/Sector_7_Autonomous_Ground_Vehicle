@@ -26,6 +26,12 @@
 //            d + s stays within 0.4 m (people walking towards the rover fail this).
 //   HOLD     no landmark: hold the course (route yaw = gyro + offset); RouteFollow uses the taught path here
 //            when its localizer is locked (Out::hold).
+//   POLE     (19.11., M59 after ramp 3) a THIN, free-standing object (pole) to pass at dRef on the footExp side
+//            (+90 = keep it on the LEFT): course = ref + lineOff; while the pole is ahead, turn = kp * (y - dRef)
+//            (y = its sideways distance, + = left; a pole on the wrong side is crossed over), limited to +-satDeg.
+//            Pole = a cluster of scan points no wider than a (m), nothing within b (m) behind it, |y| <= dMax,
+//            0.2-3 m ahead. The phase (= the leg, if it is the last) ENDS when the pole, seen in >= 2 scans, is
+//            c metres or less ahead (0 = beside the LiDAR). Not seen before sTo -> ends on distance as usual.
 //   CENTER   (11.11.) both side lines: stay in the middle, e = (dL - dR) / 2 (+ = too far right of the middle...
 //            see .cpp); only the left line: keep it at dRef; only the right line: keep it at a (taught right distance).
 // No valid line in a phase -> HOLD for that scan (the gyro bridges gaps of a few seconds).
@@ -60,7 +66,7 @@ struct LmkPhase {
 
 class LandmarkLeg {
 public:
-  enum Type : uint8_t { HOLD = 0, ANCHOR = 1, SIDE = 2, EDGE = 3, CORRIDOR = 4, ENTRANCE = 5, STOP = 6, CENTER = 7 };
+  enum Type : uint8_t { HOLD = 0, ANCHOR = 1, SIDE = 2, EDGE = 3, CORRIDOR = 4, ENTRANCE = 5, STOP = 6, CENTER = 7, POLE = 8 };
   struct Out {
     float yawDes = 0;    // route yaw to steer to
     float dOff = 0;      // heading anchor correction for RouteFollow::_off (deg)
@@ -104,6 +110,7 @@ private:
   bool _done = false;
   float _I = 0, _dPrev = -1, _deF = 0, _latch = -1, _sStop = -1, _dropBase = -1;
   float _lastD = 0, _lastE = 0, _turn = 0;
+  bool _poleFind(const uint16_t* scan, float side, float dMax, float wMax, float iso, float& px, float& py) const;
   uint8_t _hit = 0, _hitN = 0, _evt = 0, _evtN = 0;   // 5-scan (STOP) / 3-scan (ENTRANCE) bit histories
   float _w[5]; uint8_t _wN = 0;
   float _holdOff = 0, _holdT = 99;                    // last (yawDes - ref) from a line, s since then

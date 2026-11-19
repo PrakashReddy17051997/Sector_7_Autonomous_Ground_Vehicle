@@ -108,6 +108,9 @@ public:
   // (relative gyro yaw + the offset corrected on the wall legs before). The leg ends on the taught
   // distance (effort) + the LiDAR end-scan match. Obstacle handling and SafetyGuard stay on; the LiDAR
   // localiser keeps running so it can lock again on the next leg.
+  // 19.11. (log_042): landmark legs that use ODOMETRY only - the locked localizer neither sets their distance nor
+  // ends them (it jumped 4 m ahead on legs 8-9 and ended them early). Bit i = leg i+1.
+  uint32_t lmkOdoLegs = (1u << 7) | (1u << 8);
   uint32_t yawLegs = (1u << 14);   // log_027: leg 15 (M71-M72, open area); the other legs follow the path when the LiDAR match holds
   bool onYawLeg() const { return active() && ((yawLegs >> _i) & 1u); }
   uint32_t turnTimeoutMs = 12000;  // TURN between legs: after this long drive the leg anyway (no hang)
