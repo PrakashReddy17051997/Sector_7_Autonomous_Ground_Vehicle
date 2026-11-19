@@ -70,16 +70,15 @@ static const LmkPhase kLeg7[] = {
   {LandmarkLeg::SIDE, 90, 0.0f, 2.8f, 0.80f, 0.30f, 3.30f, 10, 1.5f, 20, 15, 10, 1.0f, 0.05f, 0, 0, 0, 0, 0.3f},  // 13.11.: ramp end M55-M57 - left wall at 0.8 m (taught 2.47 m)
 };
 // leg 8 (M57-M60), taught 8.0 m, ref -99.2 deg
+// 19.11. (log_042): legs 8-9 HOLD THE IMU HEADING - the localizer jumped 4 m ahead (false match) and ended legs 8-9
+// after 3.2 / 1.9 m, so the leg-10 right turn came at M59 instead of M61. No wall rows (log_038: 50-78 deg off).
 static const LmkPhase kLeg8[] = {
-  {LandmarkLeg::SIDE, 90, 0.0f, 6.0f, 3.17f, 2.06f, 4.28f, 10, 1.5f, 20, 8, 10, 1.0f, 0.05f, 0, 0, 0, 0, 9.6f},  // left line 3.17 m (146 scans)
-  {LandmarkLeg::SIDE, 90, 6.0f, 8.0f, 4.00f, 2.60f, 5.40f, 10, 1.5f, 20, 8, 10, 1.0f, 0.05f, 0, 0, 0, 0, 4.9f},  // left line 4.00 m (22 scans)
-  {LandmarkLeg::SIDE, 90, 8.0f, 8.0f, 4.43f, 2.88f, 5.98f, 10, 1.5f, 20, 8, 10, 1.0f, 0.05f, 0, 0, 0, 0, 5.2f},  // left line 4.43 m (3 scans)
+  {LandmarkLeg::SIDE, 90, 0.0f, 8.0f, 50.0f, 49.0f, 49.5f, 0, 0, 0, 0, 0, 99.0f, 0.0f, 0, 0, 0, 0, 0.0f},  // 19.11. HEADING ONLY (never a line)
 };
 // leg 9 (M60-M61), taught 4.2 m, ref -112.9 deg
 static const LmkPhase kLeg9[] = {
-  {LandmarkLeg::HOLD, 0, 0.0f, 2.0f, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0},  // no usable line: heading / taught path
-  {LandmarkLeg::SIDE, 90, 2.0f, 2.2f, 4.08f, 2.65f, 5.51f, 10, 1.5f, 20, 8, 10, 1.0f, 0.05f, 0, 0, 0, 0, 18.4f},  // left line 4.08 m (304 scans)
-  {LandmarkLeg::STOP, 0, 2.2f, 7.2f, 2.43f, 0.8f, 6.0f, 0, 0, 0, 0, 12, 1.5f, 0.05f, 0, 0, 0, 0, 18.8f},  // wall ahead, taught end 2.43 m
+  {LandmarkLeg::SIDE, 90, 0.0f, 2.2f, 50.0f, 49.0f, 49.5f, 0, 0, 0, 0, 0, 99.0f, 0.0f, 0, 0, 0, 0, 0.0f},  // 19.11. HEADING ONLY (never a line)
+  {LandmarkLeg::STOP, 0, 2.2f, 7.2f, 2.43f, 0.8f, 6.0f, 0, 0, 0, 0, 12, 1.5f, 0.0f, 0, 0, 0, 0, 18.8f},  // wall ahead, taught end 2.43 m (19.11.: anchor 0 - only ends the leg)
 };
 // leg 10 (M61-M63), taught 6.7 m, ref -183.0 deg
 static const LmkPhase kLeg10[] = {

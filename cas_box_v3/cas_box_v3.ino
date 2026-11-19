@@ -271,7 +271,8 @@ void setup() {
   // 11.11. (log_032): legs 6-15 (ramp M51-M57 and the open area M57-M72) on landmark lines, tables from log_027
   if (LMK_LEGS_6_15)
     for (const LmkLegReg& g : kLmkLegs)
-      if (g.leg <= 7 || g.leg >= 10)   // 13.11. (log_038): legs 8-9 on the taught path - their wall rows steered 50-78 deg off
+      // 19.11. (log_042): ALL legs registered again - legs 8-9 are heading-only rows (LandmarkRoute.h), the localizer
+      // can no longer end them early (13.11.-18.11.: legs 8-9 were on the taught path)
         mission.route.setLandmarkLeg(g.leg - 1, g.ph, g.n, g.lenM);
   mission.needHeartbeat = !MISSION_QUIET;   // phone off -> the mission must run without the page heartbeat
   radio.quietOnMission = MISSION_QUIET;
