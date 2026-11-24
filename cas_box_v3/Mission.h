@@ -69,7 +69,7 @@ public:
   uint8_t logByte() const { return route.logByte(); }   // route leg / state for DriveLog
   uint8_t logLeg() const { return route.logLeg(); }     // full leg number for DriveLog (v2)
   // 18.11.: countdown start - the whole route from leg 1, as the page button 'Run whole route'
-  void requestRoute(float speed) { _reqLeg = 0; _reqOnly = false; _reqSpeed = speed; _aliveMs = millis(); _reqRoute = true; }
+  void requestRoute(float speed, uint8_t leg = 0) { _reqLeg = leg; _reqOnly = false; _reqSpeed = speed; _aliveMs = millis(); _reqRoute = true; }
   RouteFollow route;
 
 private:

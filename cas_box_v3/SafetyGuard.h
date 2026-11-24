@@ -38,6 +38,14 @@ public:
     int angledStopCm = 25;                    // front-angled ultrasonic
     int lidarStopCm = 30;                     // LiDAR in the front sector
     int lidarHalfAngleDeg = 20;               // front sector = +-20 deg
+    // 24.11. LiDAR BODY STOP (a person stood in front of the rover and it drove into him): every LiDAR point in the
+    // strip as wide as the rover (+ margin) ahead of the bumper counts. Closer than lidarBodyStopCm to the BUMPER ->
+    // stop. Needs 2 points in one scan (legs, a box, a wall give several) or 1 point for 2 checks in a row (noise
+    // drops out). 0 = off (the sketch switches it off on the ramp: the LiDAR sees the ramp surface).
+    int lidarBodyStopCm = 30;                 // from the front bumper
+    float lidarNoseCm = 12.5f;                // LiDAR centre -> front bumper (sketch: LIDAR_NOSE_CM)
+    float lidarSideCm = 12.5f;                // LiDAR centre -> body side (sketch: LIDAR_SIDE_CM)
+    float lidarMarginCm = 5.0f;               // strip = body width + this on each side
     int backStopCm = 20;                      // back ultrasonic
     int sideStopCm = 15;                      // 19.11.: left / right ultrasonic (driving forward)
   };
@@ -70,6 +78,7 @@ public:
       // 19.11. (log_048: floor echo 40-70 cm with the LiDAR free) alone only below frontUsAloneCm
       if (usNear && ((s.usCm(0) < cfg.frontUsAloneCm && millis() - _usMs >= 1000) || _lidarFrontMinCm(s) < (uint16_t)(cfg.frontStopCm + 30))) why = FRONT_US;
       else if (cfg.useFrontAngled && _valid(s.usCm(4)) && s.usCm(4) < cfg.angledStopCm) why = FRONT_ANGLED;
+      else if (_lidarBodyStop(s)) why = FRONT_LIDAR;                   // 24.11.: body-wide strip, from the bumper
       else if (_lidarFrontMinCm(s) < cfg.lidarStopCm) why = FRONT_LIDAR;
       else if (_sideNear(s, 1) || _sideNear(s, 2)) why = SIDE_US;   // 19.11.
       if (why != OK) v = 0;
@@ -104,6 +113,23 @@ public:
 private:
   // ultrasonic 0 = not measured yet (UsManager start value)
   static bool _valid(int cm) { return cm > 2; }
+
+  // 24.11.: LiDAR points in the rover-wide strip ahead, closer than lidarBodyStopCm to the bumper
+  bool _lidarBodyStop(const Sensors& s) {
+    if (cfg.lidarBodyStopCm <= 0 || !s.lidarOk()) { _lbN = 0; return false; }
+    const float half = cfg.lidarSideCm + cfg.lidarMarginCm, reach = cfg.lidarNoseCm + cfg.lidarBodyStopCm;
+    uint8_t pts = 0;
+    for (uint8_t k = 0; k < Sensors::kLidarPoints; k++) {
+      const uint16_t cm = s.lidarCm(k);
+      if (!cm) continue;
+      const float a = (k * 4.0f + 2.0f) * DEG_TO_RAD;                // bins clockwise from the front, bin centre
+      const float al = cm * cosf(a), lt = cm * sinf(a);
+      if (al > 0 && al < reach && fabsf(lt) < half) pts++;
+    }
+    if (pts == 0) { _lbN = 0; return false; }
+    if (_lbN < 255) _lbN++;
+    return pts >= 2 || _lbN >= 2;
+  }
 
   // closest LiDAR return within +-lidarHalfAngleDeg of the front; 0xFFFF if nothing seen
   uint16_t _lidarFrontMinCm(const Sensors& s) const {
@@ -144,5 +170,6 @@ private:
   }
 
   bool _tilted = false;
+  uint8_t _lbN = 0;     // 24.11.: checks in a row with a point in the body strip
   uint32_t _usMs = 0;   // since when the front ultrasonic reads close (0 = not close)
 };

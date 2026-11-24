@@ -1,0 +1,219 @@
+#include "LandmarkLeg.h"
+
+using LineFeat::wrap180;
+
+const char* LandmarkLeg::typeName() const {
+  static const char* kNames[] = {"hold", "anchor", "side PID", "edge", "corridor", "entrance", "stop wall", "center", "pole"};
+  if (!_ph || _p >= _n) return "end";
+  const uint8_t t = _ph[_p].type;
+  return t <= POLE ? kNames[t] : "?";
+}
+
+LineFeat::Line LandmarkLeg::_line(const uint16_t* scan, float footExp, float dMin, float dMax, float minLen) const {
+  LineFeat::Cfg c;
+  c.centerDeg = footExp;
+  c.halfDeg = 45;
+  c.footExp = footExp;
+  c.footTol = 30;                  // rover heading error + line course; the course check is below
+  c.rMin = fmaxf(0.3f, dMin * 0.9f);
+  c.rMax = fminf(11.0f, dMax * 1.45f + 0.5f);   // the sector edges are ~1.4 x farther than d
+  c.minLen = minLen;
+  LineFeat::Line L = LineFeat::extract(scan, c);
+  if (L.ok && (L.d < dMin || L.d > dMax)) L.ok = false;
+  return L;
+}
+
+// PID on the distance error -> turn (deg). D on the measured distance (no kick when dRef is latched),
+// integral only while not saturated (anti-windup) and limited so that ki * I <= sat.
+float LandmarkLeg::_pid(float e, float dt, float sat, const LmkPhase& P) {
+  float de = 0;
+  if (_dPrev >= 0 && dt > 0.05f && dt < 1.0f) de = (_lastD - _dPrev) / dt;
+  _deF = 0.7f * _deF + 0.3f * de;
+  const float u = P.kp * e + P.ki * _I + P.kd * _deF;
+  if (fabsf(u) < sat || (e > 0) != (_I > 0)) _I += e * dt;
+  if (P.ki > 0) _I = _clamp(_I, -sat / P.ki, sat / P.ki);
+  return _clamp(u, -sat, sat);
+}
+
+LandmarkLeg::Out LandmarkLeg::step(const uint16_t* scan, float ry, float ref, float s, float dt, bool tilted, bool rolled) {
+  Out o;
+  o.yawDes = ref;
+  if (!_ph || _done) { o.done = true; o.why = "done"; return o; }
+
+  // ---- phase change by distance (an ENTRANCE waiting for its stop point keeps its phase)
+  while (_p < _n && s >= _ph[_p].sTo && !(_ph[_p].type == ENTRANCE && _sStop >= 0)) { _p++; _resetPhase(); }
+  if (_p >= _n) { _done = true; o.done = true; o.why = "distance end"; return o; }
+  const LmkPhase& P = _ph[_p];
+  if (s < P.sFrom || P.type == HOLD) { _dPrev = -1; o.hold = true; o.why = "hold"; return o; }
+  const bool aheadBehind = P.type == ANCHOR || P.type == STOP;
+  if (rolled || (tilted && aheadBehind)) { _dPrev = -1; _gap(o, ref, dt); o.why = rolled ? "side slope: hold" : "on slope: hold"; return o; }
+
+  const LineFeat::Line L = _line(scan, P.footExp, P.dMin, P.dMax, P.minLen);
+  // course the line stands for, and is it parallel to the leg course? (a bike rack is not)
+  const float lineYaw = wrap180(ry - wrap180(P.footExp - L.foot));
+  const float refLine = wrap180(ref + P.lineOff);          // where the line runs when on course
+  const float para = P.paraDeg + ((P.type == ANCHOR || P.type == STOP) ? 0.0f : sideParaExtraDeg);
+  const bool ok = L.ok && fabsf(wrap180(lineYaw - refLine)) <= para;
+  const float courseFromLine = wrap180(lineYaw - P.lineOff);  // the leg course as this line sees it
+  const float sideSign = P.footExp > 0 ? 1.0f : -1.0f;   // + yaw = towards a LEFT line
+  if (ok) _lastD = L.d;
+
+  switch (P.type) {
+    case ANCHOR:
+      if (ok) { o.line = true; o.dOff = P.anchorGain * wrap180(refLine - lineYaw); o.why = "anchor"; }
+      else o.why = "anchor: no line";
+      return o;
+
+    case SIDE: case EDGE: case CORRIDOR: case ENTRANCE: {
+      // ENTRANCE: has the facade stepped back / gone see-through? (checked before steering on it)
+      if (P.type == ENTRANCE && _sStop < 0) {
+        const float df = L.dropFrac();
+        if (_dropBase < 0) _dropBase = df; else if (df < _dropBase + 0.2f) _dropBase = 0.9f * _dropBase + 0.1f * df;
+        const bool recess = L.ok && _latch > 0 && L.d - _latch >= P.a;
+        const bool glass = df >= P.b && df - _dropBase >= 0.25f;
+        _evt = (uint8_t)(((_evt << 1) | (recess || glass ? 1 : 0)) & 7);
+        if (((_evt & 1) + ((_evt >> 1) & 1) + ((_evt >> 2) & 1)) >= 2) {
+          _sStop = s + P.c;
+          o.why = recess ? "entrance: facade steps back" : "entrance: glass";
+        }
+      }
+      if (_sStop >= 0 && s >= _sStop) { _done = true; o.done = true; o.why = "entrance + stop distance"; return o; }
+      // a reading far off the latched distance is the recess / a gap, not the line to steer on
+      const bool steerOk = ok && !(_latch > 0 && fabsf(L.d - _latch) > 0.6f * (P.a > 0 ? P.a : 1.0f) + 0.2f);
+      if (!steerOk) { _dPrev = -1; _gap(o, ref, dt); if (!o.why[0]) o.why = "no line: hold"; return o; }
+      if (_latch < 0) _latch = L.d;
+      const float dSet = (P.type == SIDE && P.dRef > 0) ? P.dRef : (P.dRef > 0 ? P.dRef : _latch);
+      const float e = L.d - dSet;
+      _turn = _pid(e, dt, P.satDeg, P);
+      _dPrev = L.d;
+      _lastE = e;
+      o.yawDes = wrap180(courseFromLine + sideSign * _turn);
+      o.line = true;
+      _onHit(o, ref);
+      if (P.anchorGain > 0) o.dOff = P.anchorGain * wrap180(refLine - lineYaw);
+      if (!o.why[0]) o.why = P.type == SIDE ? "side PID" : "edge keep";
+      if (P.type == CORRIDOR) {   // other side: railing / facade closer than b, width in [a, a2]
+        // v3 (10.11., Arjun v12 after campus_11): the parapet line 0.35..b on the other side, and the width checked
+        // only when the facade side has a line (it may be open there); 3 of the last 5 scans (4 in a row missed it)
+        const LineFeat::Line R = _line(scan, -P.footExp, 0.35f, P.b, 0.6f);
+        const float w = L.d + R.d;
+        const bool hitC = R.ok && (!L.ok || (w >= P.a && w <= P.a2));
+        _evtN = (uint8_t)(((_evtN << 1) | (hitC ? 1 : 0)) & 31);
+        uint8_t k = 0; for (uint8_t q = 0; q < 5; q++) k += (_evtN >> q) & 1;
+        if (k >= 3) { _p++; _resetPhase(); o.why = "corridor found"; }
+      }
+      return o;
+    }
+
+    case POLE: {
+      // 19.11.: pass a thin pole on the footExp side at dRef, then the phase ends (see LandmarkLeg.h, POLE)
+      const float side = P.footExp >= 0 ? 1.0f : -1.0f;
+      const float course = wrap180(ref + P.lineOff);
+      float px = 0, py = 0;
+      const bool seen = _poleFind(scan, side, P.dMax, P.a, P.b, px, py);
+      o.yawDes = course;
+      if (!seen) { o.why = _hitN ? "pole: lost" : "pole: looking"; return o; }
+      if (_hitN < 255) _hitN++;
+      _lastD = py; o.line = true;
+      if (_hitN >= 2 && px <= P.c) { _p++; _resetPhase(); o.why = "pole passed"; if (_p >= _n) { _done = true; o.done = true; } return o; }
+      if (px > 0.3f) {                                     // still ahead: steer so it passes at dRef on its side
+        const float e = side * py - P.dRef;                // + = further out than wanted
+        _turn = _clamp(P.kp * e, -P.satDeg, P.satDeg);
+        o.yawDes = wrap180(course + side * _turn);
+        _lastE = e;
+      }
+      o.why = "pole ahead";
+      return o;
+    }
+
+    case CENTER: {
+      // left line = this phase's line (footExp +90, dRef = taught left distance), right line looked up here
+      // (taught right distance in a). Both: middle of the corridor; one: keep its taught distance; none: hold.
+      const LineFeat::Line R = _line(scan, -90.0f, 0.3f, P.a + 1.5f, P.minLen);
+      const float rYaw = wrap180(ry - wrap180(-90.0f - R.foot));
+      const bool rOk = R.ok && fabsf(wrap180(rYaw - refLine)) <= para;
+      float e; float course;
+      if (ok && rOk) {                       // + e = closer to the right wall than the middle -> steer left
+        e = 0.5f * ((L.d - R.d) - (P.dRef - P.a));    // taught asymmetry kept (the taught track was not centred)
+        course = wrap180(courseFromLine + 0.5f * wrap180(wrap180(rYaw - P.lineOff) - courseFromLine));   // mean of both
+        o.why = "center: both walls";
+      } else if (ok) {
+        e = L.d - P.dRef; course = courseFromLine; o.why = "center: left wall";
+      } else if (rOk) {
+        e = P.a - R.d; course = wrap180(rYaw - P.lineOff); o.why = "center: right wall";
+      } else { _dPrev = -1; _gap(o, ref, dt); o.why = "center: no wall"; return o; }
+      _lastD = e + 100.0f;                   // (_pid's D term takes _dPrev >= 0 as "has a previous value")
+      _turn = _pid(e, dt, P.satDeg, P);      // + = turn left (towards the left wall / away from the right)
+      _dPrev = e + 100.0f;
+      _lastE = e;
+      o.yawDes = wrap180(course + _turn);
+      o.line = true;
+      _onHit(o, ref);
+      if (P.anchorGain > 0) o.dOff = P.anchorGain * wrap180(ref - course);
+      return o;
+    }
+
+    case STOP: {
+      // crowd rule: long + straight + 3 of 5 scans + fixed in space (d + s constant)
+      _hit = (uint8_t)(((_hit << 1) | (ok ? 1 : 0)) & 31);
+      if (ok) { _w[_wN % 5] = L.d + s; _wN++; }
+      uint8_t k = 0; for (uint8_t b = 0; b < 5; b++) k += (_hit >> b) & 1;
+      bool fixed = false;
+      if (_wN >= 3) {
+        const uint8_t m = _wN < 5 ? _wN : 5;
+        float lo = 1e9f, hi = -1e9f;
+        for (uint8_t q = 0; q < m; q++) { lo = fminf(lo, _w[q]); hi = fmaxf(hi, _w[q]); }
+        fixed = hi - lo < 0.4f;
+      }
+      if (k >= 3 && fixed) {
+        o.line = ok;
+        if (ok) {
+          o.yawDes = courseFromLine;          // the course as the wall ahead sees it
+          _onHit(o, ref);
+          if (P.anchorGain > 0) o.dOff = P.anchorGain * wrap180(refLine - lineYaw);
+          if (L.d <= P.dRef) { _done = true; o.done = true; o.why = "end wall reached"; return o; }
+        }
+        if (!ok) _gap(o, ref, dt);
+        o.why = "end wall confirmed";
+      } else {
+        _gap(o, ref, dt);
+        o.why = ok ? "end wall?" : "looking for end wall";
+      }
+      return o;
+    }
+  }
+  return o;
+}
+
+// 19.11.: nearest pole-like cluster (thin, free-standing) 0.2-3 m ahead (x) and within dMax sideways (y, + = left).
+// Scan bins are 4 deg (LineFeat::binDegCcw); a cluster = neighbouring bins whose ranges differ < 0.12 m.
+bool LandmarkLeg::_poleFind(const uint16_t* scan, float side, float dMax, float wMax, float iso, float& px, float& py) const {
+  (void)side;
+  const int N = LineFeat::kN;
+  float best = 99;
+  bool found = false;
+  int i = 0;
+  while (i < N) {
+    const float r0 = scan[i] / 100.0f;
+    if (r0 < 0.15f || r0 > 3.5f) { i++; continue; }
+    int j = i;
+    while (j + 1 < N) { const float r1 = scan[j + 1] / 100.0f; if (r1 < 0.15f || fabsf(r1 - scan[j] / 100.0f) > 0.12f) break; j++; }
+    // cluster i..j: ends (points) and centre
+    const float ai = LineFeat::binDegCcw(i) * 0.017453f, aj = LineFeat::binDegCcw(j) * 0.017453f;
+    const float ri = scan[i] / 100.0f, rj = scan[j] / 100.0f;
+    const float xi = ri * cosf(ai), yi = ri * sinf(ai), xj = rj * cosf(aj), yj = rj * sinf(aj);
+    const float w = sqrtf((xi - xj) * (xi - xj) + (yi - yj) * (yi - yj));
+    const float rm = 0.5f * (ri + rj);
+    // free-standing: the bins just outside the cluster see nothing, or something at least iso further away
+    const int a = (i + N - 1) % N, b = (j + 1) % N;
+    const float ra = scan[a] / 100.0f, rb = scan[b] / 100.0f;
+    const bool freeA = ra < 0.15f || ra > rm + iso, freeB = rb < 0.15f || rb > rm + iso;
+    const float cx = 0.5f * (xi + xj), cy = 0.5f * (yi + yj);
+    if (w <= wMax && freeA && freeB && cx >= -0.8f && cx <= 3.0f && fabsf(cy) <= dMax) {
+      const float d = sqrtf(cx * cx + cy * cy);
+      if (d < best) { best = d; px = cx; py = cy; found = true; }
+    }
+    i = j + 1;
+  }
+  return found;
+}

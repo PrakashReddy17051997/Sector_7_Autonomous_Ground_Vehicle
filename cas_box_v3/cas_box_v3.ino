@@ -84,7 +84,7 @@
 #include <esp_wifi.h>
 
 // ---- YOUR KIT ------------------------------------------------------------------------------
-const int BOX_ID = 7;                      // 1..10 = kit number on the box (10.11.: box 7 + rover 7)
+const int BOX_ID = 10;                      // 1..10 = kit number on the box (10.11.: box 7 + rover 7)
 // Wi-Fi transmit power: at start (smallest current spike) and while running. Raise WIFI_TX_RUN to
 // WIFI_POWER_19_5dBm only if the phone or the rover lose the connection - and only with a good supply.
 #define WIFI_TX_START WIFI_POWER_8_5dBm
@@ -333,6 +333,8 @@ void setup() {
   // ground) and blocked 64 % of all forward commands -> stop-go jerking. Off for obstacle stops;
   // it stays in the log as a candidate cliff sensor (reading jumps up at an edge).
   guard.cfg.useFrontAngled = false;
+  guard.cfg.lidarNoseCm = LIDAR_NOSE_CM;   // 24.11.: LiDAR body stop measures from the bumper
+  guard.cfg.lidarSideCm = LIDAR_SIDE_CM;
   // guard.cfg.frontStopCm = 25;
 
   Serial.println("[boot] 4 log + web ready, starting sensors (LiDAR motor) in 0.5 s");
@@ -386,7 +388,7 @@ void loop() {
     was = act;
   }
   // 18.11.: countdown at 0 s -> whole route (the start pose is found by the start alignment)
-  if (countdown.poll(sensors) && !mission.active()) mission.requestRoute(countdown.speed);
+  if (countdown.poll(sensors) && !mission.active()) mission.requestRoute(countdown.speed, countdown.leg);   // 24.11.: + start leg
   mission.pollRequests(sensors, wall, nav);
   if (mission.active()) { if (t90.on) turn90Stop("mission started"); mission.steer(sensors, wall, nav, padL, padR, age, l, r); }
   else turn90Step(padL, padR, age, l, r);   // Left / Right 90 buttons (manual only)
@@ -396,6 +398,7 @@ void loop() {
   // ramp legs of the route: the LiDAR sees the ramp surface as a wall -> LiDAR stop off there
   // (front ultrasonic 25 cm and tilt stay on), see RouteFollow::rampLegs
   guard.cfg.lidarStopCm = mission.route.onRamp() ? 0 : 30;
+  guard.cfg.lidarBodyStopCm = mission.route.onRamp() ? 0 : 30;   // 24.11.: 30 cm before the bumper (off on the ramp)
   // log_018: at the ramp foot the front ultrasonic read 9-23 cm (the ramp surface) -> stop / kick /
   // stop. On ramp legs it stops only for something really close.
   guard.cfg.frontStopCm = mission.route.onRamp() ? 10 : 50;   // 19.11.: 50 cm (was 25)
