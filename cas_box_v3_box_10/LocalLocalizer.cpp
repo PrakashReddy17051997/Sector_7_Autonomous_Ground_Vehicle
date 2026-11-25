@@ -6,6 +6,7 @@
 using namespace LocalPathMap;
 
 static const float kRes = 0.10f, kStep = 0.25f;
+static const float kInvRes = 1.0f / kRes;   // 25.11.: multiply instead of divide in scoreAt (hot loop)
 static const float kRmax = 10.0f;   // = localpath.py RMAX (open areas: half the points are 6-11 m away)
 static const int8_t kDthWide[] = {-20, -16, -12, -8, -4, 0, 4, 8, 12, 16, 20};
 static const int8_t kDthCoarse[] = {-4, -2, 0, 2, 4};
@@ -35,6 +36,7 @@ void LocalLocalizer::begin(uint8_t leg) {
   _off = 0;
   _histN = 0;
   _histI = 0;
+  _relocWait = 0;
   _buildWp();
 }
 
@@ -149,7 +151,7 @@ float LocalLocalizer::scoreAt(const float* px, const float* py, int n, float x, 
   int sum = 0;
   for (int k = 0; k < n; k++) {
     const float wx = x + c * px[k] - s * py[k], wy = y + s * px[k] + c * py[k];
-    const int i = (int)((wx - lx) / kRes), j = (int)((wy - ly) / kRes);
+    const int i = (int)((wx - lx) * kInvRes), j = (int)((wy - ly) * kInvRes);
     if (i < 0 || i >= L.nx || j < 0 || j >= L.ny) continue;
     const uint32_t idx = (uint32_t)i * L.ny + j;
     const uint8_t b = L.grid[idx >> 1];
@@ -204,10 +206,25 @@ void LocalLocalizer::_match(const float* px, const float* py, int n, bool wide) 
   }
 }
 
+// 25.11. (log_054, box 10 / rover 10): the old search (13 path points x 5 headings x 228 poses, every
+// pose scored with all ~65 scan points = ~1 M point lookups) blocked loop() for 0.6-1.1 s. While the
+// match stayed weak (campus store pillars, box 10 matching the box-7 map worse) it ran on EVERY scan:
+// IMU sample older than 0.5 s -> Sensors::imuOk() false -> RouteFollow "IMU invalid - standing" ->
+// soft brake, ramp up, next freeze = the start-stop jerking. 100 % of the IMU-invalid records in
+// log_054 come right after such a gap. Now:
+//   coarse  every 2nd scan point, same candidates (path points x headings x 9x9 grid)
+//   fine    all points, only for the best kRelocTop coarse candidates
+//   rate    at most one search per kRelocEvery scans (4 Hz -> once per second) while lost
 void LocalLocalizer::_relocate(const float* px, const float* py, int n) {
+  if (_relocWait > 0) { _relocWait--; return; }
+  _relocWait = kRelocEvery - 1;
   const Leg& L = kLeg[_leg];
+  float hx[(kN + 1) / 2], hy[(kN + 1) / 2];   // every 2nd point (stack: loop task)
+  int hn = 0;
+  for (int k = 0; k < n; k += 2) { hx[hn] = px[k]; hy[hn] = py[k]; hn++; }
   const int span = 12;  // 3 m / 0.25 m
-  Best best{0, 0, 0, -9.0f};
+  Best top[kRelocTop], pri[kRelocTop];   // best coarse poses and the path pose each one started from (prior)
+  for (int k = 0; k < kRelocTop; k++) top[k] = pri[k] = Best{0, 0, 0, -1e9f};
   const int q0 = (int)_pi - span < 0 ? 0 : (int)_pi - span;
   const int q1 = (int)_pi + span + 1 < (int)L.nPath ? (int)_pi + span + 1 : (int)L.nPath;
   for (int q = q0; q < q1; q += 2) {
@@ -216,10 +233,20 @@ void LocalLocalizer::_relocate(const float* px, const float* py, int n) {
     const float th0 = atan2f(ay, ax);
     for (int d = -20; d <= 20; d += 10) {
       const float cx = L.path[2 * q] * 0.01f, cy = L.path[2 * q + 1] * 0.01f, ct = th0 + d * kDeg;
-      const Best b1 = _search(px, py, n, cx, cy, ct, 0.05f, 4, kDthZero, 1, cx, cy, ct, 0.3f, 0.3f);
-      const Best b2 = _search(px, py, n, b1.x, b1.y, b1.th, 0.02f, 3, kDthFine, 3, cx, cy, ct, 0.3f, 0.3f);
-      if (b2.sc > best.sc) best = b2;
+      const Best b1 = _search(hx, hy, hn, cx, cy, ct, 0.05f, 4, kDthZero, 1, cx, cy, ct, 0.3f, 0.3f);
+      int k = kRelocTop;                                   // insert into the sorted top list
+      while (k > 0 && b1.sc > top[k - 1].sc) k--;
+      if (k >= kRelocTop) continue;
+      for (int m = kRelocTop - 1; m > k; m--) { top[m] = top[m - 1]; pri[m] = pri[m - 1]; }
+      top[k] = b1; pri[k] = Best{cx, cy, ct, 0};
     }
+  }
+  Best best{0, 0, 0, -9.0f};
+  for (int k = 0; k < kRelocTop; k++) {
+    if (top[k].sc < -1e8f) break;
+    const Best b2 = _search(px, py, n, top[k].x, top[k].y, top[k].th, 0.02f, 3, kDthFine, 3,
+                            pri[k].x, pri[k].y, pri[k].th, 0.3f, 0.3f);
+    if (b2.sc > best.sc) best = b2;
   }
   if (best.sc > acceptReloc) {
     _x = best.x; _y = best.y; _th = best.th;
@@ -406,13 +433,17 @@ bool LocalLocalizer::alignSearch(const uint16_t* scanCm, uint8_t leg, float maxO
   // 18.11. (random start pose): the closer-is-likelier penalty is scaled to the search range, else a rover put down
   // 1.5 m off is always matched at the nearest grid points
   const float pen = 0.3f / fmaxf(1.0f, maxOffM * maxOffM);
+  // 25.11.: the coarse full-circle pass scores every 2nd point (half the time; the refine below uses all)
+  float hx[(kN + 1) / 2], hy[(kN + 1) / 2];   // every 2nd point (stack: loop task)
+  int hn = 0;
+  for (int k = 0; k < n; k += 2) { hx[hn] = px[k]; hy[hn] = py[k]; hn++; }
   float sc[90];
   float bx[90], by[90];
   for (int t = 0; t < 90; t++) {
     const float th = (t * 4 - 180) * kDeg;
     sc[t] = -9; bx[t] = by[t] = 0;
     for (int ix = -nh; ix <= nh; ix++) for (int iy = -nh; iy <= nh; iy++) {
-      const float v = tmp.scoreAt(px, py, n, ix * 0.2f, iy * 0.2f, th) - pen * (ix * ix + iy * iy) * 0.04f;
+      const float v = tmp.scoreAt(hx, hy, hn, ix * 0.2f, iy * 0.2f, th) - pen * (ix * ix + iy * iy) * 0.04f;
       if (v > sc[t]) { sc[t] = v; bx[t] = ix * 0.2f; by[t] = iy * 0.2f; }
     }
   }
@@ -439,5 +470,6 @@ void LocalLocalizer::setPose(float x, float y, float th) {
   _x = x; _y = y; _th = wrapPi(th);
   _first = false;     // pose known: narrow matching from now on
   _lost = 0;
+  _relocWait = 0;
   _project();
 }

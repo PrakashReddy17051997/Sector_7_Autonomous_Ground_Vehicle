@@ -15,6 +15,8 @@
 //   lost     8 unaccepted scans or > 1 m off the path: search along the taught path (3 m back to
 //            3 m ahead, every 0.5 m, path direction +-20 deg) - the distance along a straight
 //            corridor is the uncertain direction. Score > 0.45 -> accepted.
+//            25.11.: coarse on every 2nd point, fine only for the best 3, at most once per second
+//            (the old full search froze loop() 0.6-1.1 s per scan -> "IMU invalid", log_054).
 //   end      position along the path >= sEnd - 0.25 m -> atEnd(); the caller hands over with
 //            nextLeg() (pose moved into the next leg's frame).
 // Replay check: tools/localpath.py replay  (log_012 on the log_013 legs: 17 of 17 legs, 73 %).
@@ -102,6 +104,8 @@ private:
   uint16_t _pi = 0;
   bool _ok = false, _first = true, _atEnd = false;
   uint8_t _lost = 0;
+  uint8_t _relocWait = 0;       // 25.11.: scans until the next lost-search may run (see _relocate)
+  static const uint8_t kRelocEvery = 4, kRelocTop = 3;
   uint16_t _hist[4][kN];        // last 4 scans (still detection over 1 s)
   uint8_t _histN = 0, _histI = 0;
   static const uint8_t kMaxWp = 40;
