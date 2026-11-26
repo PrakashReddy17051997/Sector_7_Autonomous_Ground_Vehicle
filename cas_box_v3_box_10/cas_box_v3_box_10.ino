@@ -107,7 +107,7 @@ const bool USE_SAFETY_GUARD = true;       // false = drive commands go to the ro
 const bool START_ALIGN = true;            // false = old start (rover parallel to the wall)
 const uint8_t OPEN_SEA_LEG = 2;           // route leg driven on landmarks (kOpenSea), 0 = off
 const uint8_t BLOCK_I_LEG = 0;            // last leg to Block I (kBlockI), 0 = off (not taught yet)
-const bool LMK_LEGS_6_15 = true;          // legs 6-15 on landmark lines (LandmarkRoute.h kLmkLegs), false = taught path
+const bool LMK_LEGS_6_15 = false;         // 26.11.: OFF - legs 5-11 are the log_056 taught path now (kLmkLegs were for log_027 legs 6-15)
 const bool MISSION_QUIET = false;         // START value of the page switch "Phone OFF during the mission" (11.11.:
                                           // off = tests with feedback; switch it on on the page for the demo)
 // 11.11.: rover 7 needs 0.5 to pivot - the pad turn keys and the Left/Right 90 buttons pivot at this,

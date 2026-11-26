@@ -101,7 +101,7 @@ public:
   // stop off; the front ULTRASONIC stop (25 cm), the tilt stop and the stuck detection stay ON.
   // log_013 route: leg 4 (M5-M10, ramp up/down), leg 5 (M10-M13, ramp), leg 11 (M23-M28, ramp).
   // log_026 (06.11.): leg 4 (M16-M37) holds the ramp (160 s above 4 deg pitch, up to 18 deg)
-  uint32_t rampLegs = (1u << 1) | (1u << 5);   // log_027: legs 2 (M15-M34) and 6 (M45-M55) hold the ramps
+  uint32_t rampLegs = (1u << 1) | (1u << 5);   // legs 2 (log_027 M15-M34) and 6 (log_056 M47-M48, ramp 3) hold the ramps
   // YAW-ONLY legs (bit i = leg i+1), 06.11.: open area / ramp, where the LiDAR match is weak (replay of
   // log_025 on the log_026 map located legs 1-4 at 90-100 %; legs 2 and 11 are the open areas). On these legs the
   // rover does NOT steer on the LiDAR path: it holds the taught heading ref in the route yaw frame
@@ -110,7 +110,7 @@ public:
   // localiser keeps running so it can lock again on the next leg.
   // 19.11. (log_042): landmark legs that use ODOMETRY only - the locked localizer neither sets their distance nor
   // ends them (it jumped 4 m ahead on legs 8-9 and ended them early). Bit i = leg i+1.
-  uint32_t lmkOdoLegs = (1u << 7) | (1u << 8);
+  uint32_t lmkOdoLegs = 0;   // 26.11.: legs 8/9 (pole, log_027) are gone - legs 5-11 are log_056 path legs
   // 26.11. (log_055, box 10): leg 9 drove its first 3 m on the bare IMU course, ~20 deg right into the kerb, and the
   // wall ahead was never seen -> it ended on distance and leg 10 turned 70 deg right in the open area. Now:
   //   lmkPathLegs     the taught path STEERS whenever no landmark line steers (HOLD phase, no line, on slope) and the
@@ -121,16 +121,17 @@ public:
   //   restartLegs     the leg begins like a fresh start: stand, LiDAR start check (alignSearch +-0.8 m) -> new heading
   //                   offset + localizer pose. Not sure -> drive on with the gyro, never turn on a doubtful check.
   //                   Leg 9 = after the pole, on flat ground (leg 8 begins still tilted at the ramp end).
-  uint32_t lmkPathLegs = (1u << 8);
-  uint32_t lmkNeedEndLegs = (1u << 8);
-  uint32_t restartLegs = (1u << 8);
+  // 26.11.: 0 since the log_056 route (legs 5-11 are taught-path legs, not landmark legs); set a bit to use them again
+  uint32_t lmkPathLegs = 0;
+  uint32_t lmkNeedEndLegs = 0;
+  uint32_t restartLegs = 0;
   // 26.11. (logs 042 / 055): the pitch/roll "level" was taken only at start(): box 10 read +0.5 deg at building B and
   // -2.5..-3 deg on the flat ground after ramp 3 -> 27-58 % of legs 9-10 counted as "on a slope" and the landmark legs
   // ignored the wall ahead. Now a new level is taken in every leg: median of the first relevelS of DRIVE, only if steady
   // (max - min <= relevelSpreadDeg); never on a ramp leg or the leg right after one (begins on the ramp end).
   bool relevelLegs = true;
   float relevelS = 1.5f, relevelSpreadDeg = 1.5f;
-  uint32_t yawLegs = (1u << 14);   // log_027: leg 15 (M71-M72, open area); the other legs follow the path when the LiDAR match holds
+  uint32_t yawLegs = 0;   // 26.11.: none (log_027 leg 15 is gone); the legs follow the path when the LiDAR match holds
   bool onYawLeg() const { return active() && ((yawLegs >> _i) & 1u); }
   uint32_t turnTimeoutMs = 12000;  // TURN between legs: after this long drive the leg anyway (no hang)
   float noTurnAfterTimeoutEff = 1.5f;  // 06.11. (log_029 deadlock): after a turn time-out drive at least this
