@@ -91,6 +91,7 @@ bool RouteFollow::start(const Sensors& s, const WallFollow& wf, uint8_t i, float
   _lpYawPrev = s.yawDeg();
   _lpEffAcc = 0;
   _pitch0 = s.pitchDeg();
+  _pitchStart = _pitch0;   // 26.11.
   _roll0 = s.rollDeg();
   _slopeMs = 0; _xteI = 0; _ey = 0; _peInit = false; _noTurnEff = -99;
   _lpOkMs = 0;
@@ -474,7 +475,7 @@ void RouteFollow::_step(const Sensors& s, const WallFollow& wf) {
     for (uint8_t k = 0; k < Sensors::kLidarPoints; k++) _scan[k] = s.lidarCm(k);
     const float dy = _wrap(s.yawDeg() - _lpYawPrev) * DEG_TO_RAD;
     _lpYawPrev = s.yawDeg();
-    _lp.step(_scan, dy, _lpEffAcc, fabsf(s.pitchDeg() - _pitch0) >= 5.0f);
+    _lp.step(_scan, dy, _lpEffAcc, fabsf(s.pitchDeg() - _pitchStart) >= 5.0f);   // 26.11.: start level (log_057)
     _lpEffAcc = 0;
     if (_lp.ok()) _lpOkMs = now;
     // 06.11. (replay of log_026): "path end" alone ended legs far too early - legs whose taught path is

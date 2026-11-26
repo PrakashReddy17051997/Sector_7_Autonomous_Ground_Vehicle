@@ -129,7 +129,10 @@ public:
   // -2.5..-3 deg on the flat ground after ramp 3 -> 27-58 % of legs 9-10 counted as "on a slope" and the landmark legs
   // ignored the wall ahead. Now a new level is taken in every leg: median of the first relevelS of DRIVE, only if steady
   // (max - min <= relevelSpreadDeg); never on a ramp leg or the leg right after one (begins on the ramp end).
-  bool relevelLegs = true;
+  // 26.11. (log_057): OFF - leg 5 of the log_056 route begins on the slope before ramp 3 (pitch +4.2, steady), that
+  // became the level, the flat ground after it read 5-7 deg off -> the localizer saw "tilted" for 37 % of leg 5, lost
+  // the path and missed the left turn into the ramp. It was only needed for the log_027 landmark legs 8-9 (gone).
+  bool relevelLegs = false;
   float relevelS = 1.5f, relevelSpreadDeg = 1.5f;
   uint32_t yawLegs = 0;   // 26.11.: none (log_027 leg 15 is gone); the legs follow the path when the LiDAR match holds
   bool onYawLeg() const { return active() && ((yawLegs >> _i) & 1u); }
@@ -556,6 +559,7 @@ private:
   LocalLocalizer _lp;
   bool _lpOn = false;
   float _lpYawPrev = 0, _lpEffAcc = 0, _pitch0 = 0;
+  float _pitchStart = 0;              // 26.11.: level at start() - the localizer's tilt gate always uses this one
   uint32_t _lpOkMs = 0;
   float _fr[4] = {9, 9, 9, 9}; uint8_t _frN = 0, _frI = 0;
   // obstacle handling
