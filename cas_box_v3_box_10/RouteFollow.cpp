@@ -109,6 +109,7 @@ bool RouteFollow::start(const Sensors& s, const WallFollow& wf, uint8_t i, float
   // v3: facing off the leg -> first turn on the spot (TURN state, gyro-closed soft pivot), then drive
   _state = (aligned && fabsf(_alignDeg) > turnDoneDeg) ? TURN : DRIVE;
   _startTurn = _state == TURN; _startRounds = 0; _stepTgt = NAN; _settleMs = 0; _netM = 0;
+  _restartCheck = false; _needEndPaused = false; _lvDone = true; _lvN = 0;   // 26.11.
   _stateMs = _lastStep = millis();
   if (_state == TURN) snprintf(_msg, sizeof(_msg), "start: facing %.0f deg off - turning", _alignDeg);
   else snprintf(_msg, sizeof(_msg), "leg %u: %s", (unsigned)(i + 1), L.name);
@@ -433,6 +434,15 @@ void RouteFollow::_nextLeg(const Sensors& s, const char* how) {
   _lmkBegin();
   _state = TURN;
   _stateMs = millis();
+  // 26.11.: per-leg level (see relevelLegs) - sampled in steer() while driving this leg
+  _lvN = 0; _needEndPaused = false;
+  _lvDone = !relevelLegs || ((rampLegs >> _i) & 1u) || (_i > 0 && ((rampLegs >> (_i - 1)) & 1u));
+  // 26.11.: restart leg -> the same LiDAR start check as start() (TURN state, _startTurnStep)
+  _restartCheck = false;
+  if (((restartLegs >> _i) & 1u) && _lpOn && _i < _lp.legs()) {
+    _startTurn = true; _restartCheck = true; _startRounds = 0; _stepTgt = NAN; _settleMs = 0; _netM = 0;
+    Serial.printf("[route] leg %u: restart check (as a fresh start)\n", (unsigned)(_i + 1));
+  }
   snprintf(_msg, sizeof(_msg), "leg %u: %s%s", (unsigned)(_i + 1), _cur().name, warn);
 }
 
@@ -442,6 +452,24 @@ void RouteFollow::_step(const Sensors& s, const WallFollow& wf) {
   const uint32_t now = millis();
   const float ry = routeYaw(s);
   _stepRy = ry;
+  // 26.11.: per-leg level - median pitch / roll of the first relevelS of driving, taken only when steady
+  if (!_lvDone && _state == DRIVE) {
+    const uint8_t need = (uint8_t)_clamp(relevelS * 4.0f + 0.5f, 3.0f, 8.0f);   // 4 Hz steps
+    _lvP[_lvN] = s.pitchDeg(); _lvR[_lvN] = s.rollDeg(); _lvN++;
+    if (_lvN >= need) {
+      for (uint8_t x = 1; x < _lvN; x++) for (uint8_t q = x; q > 0 && _lvP[q - 1] > _lvP[q]; q--) { const float t = _lvP[q]; _lvP[q] = _lvP[q - 1]; _lvP[q - 1] = t; }
+      for (uint8_t x = 1; x < _lvN; x++) for (uint8_t q = x; q > 0 && _lvR[q - 1] > _lvR[q]; q--) { const float t = _lvR[q]; _lvR[q] = _lvR[q - 1]; _lvR[q - 1] = t; }
+      const float spread = _lvP[_lvN - 1] - _lvP[0];
+      if (spread <= relevelSpreadDeg) {
+        Serial.printf("[route] leg %u: level pitch %.1f -> %.1f, roll %.1f -> %.1f deg\n", (unsigned)(_i + 1),
+                      _pitch0, _lvP[_lvN / 2], _roll0, _lvR[_lvN / 2]);
+        _pitch0 = _lvP[_lvN / 2]; _roll0 = _lvR[_lvN / 2];
+      } else {
+        Serial.printf("[route] leg %u: level kept (pitch spread %.1f deg)\n", (unsigned)(_i + 1), spread);
+      }
+      _lvDone = true;
+    }
+  }
   // ---- local path localisation: every step, in every state (turns and obstacles included)
   if (_lpOn && _i < _lp.legs()) {   // 19.11.: not on legs past the map (leg 16: its end would read "path end" at once)
     // v4: during a detour the rover is off the taught path on purpose - the scan match still works there (sim:
@@ -928,13 +956,27 @@ bool RouteFollow::_lmkDrive(const Sensors& s, float ry, float v) {
     // a distance end only counts when the locked localizer agrees (same rule as the path legs); a STOP wall
     // ("end wall reached") is physically there and always ends the leg
     const bool distEnd = strcmp(o.why, "end wall reached") != 0 && strcmp(o.why, "entrance + stop distance") != 0;
+    // 26.11.: lmkNeedEndLegs - a distance end alone is not enough: the locked localizer must agree, else PAUSE once
+    if (distEnd && ((lmkNeedEndLegs >> _i) & 1u) && !_needEndPaused) {
+      const bool lpAgree = _lpOn && pathLocked() && _lp.leg() == _i && _lp.score() >= minPathScore &&
+                           _lp.s() >= lpEndAgreeFrac * _lp.sEnd() - 0.5f;
+      if (!lpAgree) {
+        _needEndPaused = true;
+        char m[56]; snprintf(m, sizeof(m), "leg %u: end wall not found - check, Resume", (unsigned)(_i + 1));
+        pause(m);
+        return true;
+      }
+    }
     if (!(distEnd && lpOk && _lp.s() < lpEndAgreeFrac * _lp.sEnd() - 0.5f)) { _nextLeg(s, o.why); return true; }
     o.hold = true; o.why = "table end, localizer: not yet"; _lmkWhy = o.why;
   }
   // last resort: far beyond the taught distance and still no end -> next leg (no endless drive)
   if (_eff > 2.5f * L.effort + 3.0f) { _forced++; _nextLeg(s, "landmark leg: last resort"); return true; }
   // HOLD phase (no landmark planned): the taught path when the localizer is locked and matches well, else the course
-  _lmkPath = o.hold && lpOk && _lp.score() >= minPathScore;
+  // 26.11.: lmkPathLegs - the taught path also steers an odometry-only leg whenever no line steers this scan
+  const bool lpSteer = _lpOn && pathLocked() && _lp.leg() == _i && _lp.sEnd() > 0.5f;
+  const bool noLine = o.hold || strstr(o.why, "hold") != nullptr;
+  _lmkPath = ((o.hold && lpOk) || (((lmkPathLegs >> _i) & 1u) && noLine && lpSteer)) && _lp.score() >= minPathScore;
   if (_lmkPath) {
     const float pe = _pathErrRad() * RAD_TO_DEG;
     if (!_peInit) { _peF = pe; _peInit = true; }
@@ -1173,8 +1215,9 @@ void RouteFollow::_startTurnStep(const Sensors& s, float ry, uint32_t now) {
   const float e = _wrap(_stepTgt - ry);
   if (fabsf(e) >= startDoneDeg || _pivoting) {
     if (now - _stateMs > startTurnTimeoutMs) {
-      pause("start: cannot turn - turn by hand, Resume");
       _startTurn = false;
+      if (_restartCheck) { _restartCheck = false; _state = DRIVE; _stateMs = now; return; }   // 26.11.: mid-route: drive on
+      pause("start: cannot turn - turn by hand, Resume");
       return;
     }
     _drive(e, _speed, false);                                // on the spot / tactics (forward only inside them)
@@ -1202,10 +1245,13 @@ void RouteFollow::_startTurnStep(const Sensors& s, float ry, uint32_t now) {
   Serial.printf("[route] start check %u: %s, %.0f deg off the leg, score %.2f (2nd %.2f)\n", (unsigned)_startRounds,
                 ok ? "OK" : "not sure (gyro kept)", rest, sc, sec);
   _alignSc = sc; _alignSec = sec; _alignDeg = rest;
+  // 26.11.: a mid-route restart check never turns on a doubtful result (gyro kept, drive on)
+  if (_restartCheck && !ok) { _startTurn = false; _restartCheck = false; _state = DRIVE; _stateMs = now;
+    snprintf(_msg, sizeof(_msg), "leg %u: %s (check not sure)", (unsigned)(_i + 1), L.name); return; }
   // up to startDoneDeg off: drive - the rolling heading hold (curve, inner wheel >= 50 %) takes the rest; a 0.35 pivot
   // coasts ~10-14 deg and cannot make a small correction without overshooting (sim: endless re-checks)
   if (fabsf(rest) > startDoneDeg && _startRounds < startMaxRounds) { _stepTgt = NAN; _stateMs = now; return; }
-  _startTurn = false;
+  _startTurn = false; _restartCheck = false;
   _state = DRIVE; _stateMs = now;
   snprintf(_msg, sizeof(_msg), "leg %u: %s", (unsigned)(_i + 1), L.name);
 }

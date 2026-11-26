@@ -82,7 +82,9 @@ static const LmkPhase kLeg8[] = {
 // 19.11.: leg 9 = from the pole (M59) STRAIGHT to the leg-10 wall (M61, ~7-8 m): IMU heading only (ref -112.9 =
 // the M59-M61 direction), the wall ahead at 2.43 m ends it. Odometry only (lmkOdoLegs: no localizer jump ends it).
 static const LmkPhase kLeg9[] = {
-  {LandmarkLeg::SIDE, 90, 0.0f, 3.0f, 50.0f, 49.0f, 49.5f, 0, 0, 0, 0, 0, 99.0f, 0.0f, 0, 0, 0, 0, 0.0f},  // HEADING ONLY (never a line)
+  // 26.11. (log_055): was HEADING ONLY (bare IMU course, ~20 deg right into the kerb) -> HOLD = the taught path steers
+  // while the localizer is locked (RouteFollow::lmkPathLegs), the course only fills the gaps
+  {LandmarkLeg::HOLD, 0, 0.0f, 3.0f, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0},
   {LandmarkLeg::STOP, 0, 3.0f, 10.0f, 2.43f, 0.8f, 6.0f, 0, 0, 0, 0, 12, 1.5f, 0.0f, 0, 0, 0, 0, 18.8f},  // wall ahead, taught end 2.43 m (anchor 0)
 };
 // leg 10 (M61-M63), taught 6.7 m, ref -183.0 deg
