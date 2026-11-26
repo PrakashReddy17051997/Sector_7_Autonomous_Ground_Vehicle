@@ -950,6 +950,11 @@ bool RouteFollow::_lmkDrive(const Sensors& s, float ry, float v) {
   _lmkWhy = o.why;
   // the locked localizer at the end of the taught path ends a landmark leg too (like the path legs)
   if (!o.done && lpOk && _lp.atEnd() && _eff >= pathEndMinFrac * L.effort) { o.done = true; o.why = "path end"; }
+  // 26.11. (log_055 11:45): leg 9 starts at the pole, the taught path M60-M61 is only 3.5 m, the table runs to 8-10 m:
+  // the localizer passed the taught leg end at 731 s, the leg went on 20 s (~6 m) on odometry into the open area.
+  // lmkNeedEndLegs: the locked localizer at the path end ends the leg (after >= 2 m, against a jump at the start)
+  const bool lpNeedEnd = ((lmkNeedEndLegs >> _i) & 1u) && _lpOn && pathLocked() && _lp.leg() == _i && _lp.sEnd() > 0.5f;
+  if (!o.done && lpNeedEnd && _lp.score() >= minPathScore && _lp.atEnd() && legMetres() >= 2.0f) { o.done = true; o.why = "path end (locked)"; }
   // heading anchor (removes gyro drift): at most 0.5 deg per scan, like the wall legs
   if (o.dOff != 0) _off = _wrap(_off + _clamp(o.dOff, -0.5f, 0.5f));
   if (o.done) {
@@ -959,7 +964,7 @@ bool RouteFollow::_lmkDrive(const Sensors& s, float ry, float v) {
     // 26.11.: lmkNeedEndLegs - a distance end alone is not enough: the locked localizer must agree, else PAUSE once
     if (distEnd && ((lmkNeedEndLegs >> _i) & 1u) && !_needEndPaused) {
       const bool lpAgree = _lpOn && pathLocked() && _lp.leg() == _i && _lp.score() >= minPathScore &&
-                           _lp.s() >= lpEndAgreeFrac * _lp.sEnd() - 0.5f;
+                           _lp.s() >= lpEndAgreeFrac * _lp.sEnd() - 0.5f && _lp.s() <= _lp.sEnd() + 1.0f;   // not far past it
       if (!lpAgree) {
         _needEndPaused = true;
         char m[56]; snprintf(m, sizeof(m), "leg %u: end wall not found - check, Resume", (unsigned)(_i + 1));
