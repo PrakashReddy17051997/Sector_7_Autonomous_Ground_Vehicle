@@ -538,8 +538,10 @@ private:
   float _Ld = 1.0f, _ey = 0, _xteI = 0, _peF = 0;   // look-ahead (m), cross-track (m, + = left), integral (deg), filtered pursuit error
   bool _peInit = false;
   int8_t _curveLeg = -1;    // 27.11.: leg the curve base belongs to
+  int8_t _curveDriveLeg = -1; float _curveEff0 = 0;   // 27.11. (log_069): distance counted from the end of the leg's turn
   float _curveBase = 0;     // 27.11.: route yaw of that leg frame's x axis
   float _curveYaw(const Sensors& s, float aheadM);
+  float _curveDist() const;
   float _noTurnEff = -99;             // effort at the last turn time-out
   float _tgtYaw = 0, _tgtV = 0, _yawDesF = 0, _rate = 0, _prevYaw = 0;
   uint32_t _ctrlMs = 0, _pivotMs = 0, _unstallUntil = 0, _arcMs = 0;

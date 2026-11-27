@@ -84,7 +84,7 @@ bool RouteFollow::start(const Sensors& s, const WallFollow& wf, uint8_t i, float
     _off = _wrap(L.ref - s.yawDeg());  // rover points along the leg
   }
   _i = i;
-  _curveLeg = -1;   // 27.11.: IMU curve base is taken fresh
+  _curveLeg = -1; _curveDriveLeg = -1;   // 27.11.: IMU curve base / distance taken fresh
   _loc.enabled = RouteLocalizer::mapLegs() == kN;  // map from another teaching run: do not use it
   if (!_loc.enabled)
     Serial.printf("[route] RouteMap.h has %u legs, kRoute %u - LiDAR end match OFF (old rule). "
@@ -192,8 +192,15 @@ float RouteFollow::_curveYaw(const Sensors& s, float aheadM) {
     }
     _curveLeg = (int8_t)_i;
   }
-  const float sNow = _eff * lmkMPerEff + aheadM;
+  const float sNow = _curveDist() + aheadM;
   return _wrap(_curveBase + (_lpOn && _lp.leg() == _i ? _lp.tangentAt(sNow) * RAD_TO_DEG : 0.0f));
+}
+
+// 27.11. (log_069): metres driven on the curve leg since its turn ended. The turn's forward curves (K-turn at the
+// pole, ~1 m of effort) counted as distance: leg 7 ended early, leg 8 passed the step at 16 cm and turned right for
+// the K corner ~0.8 m early.
+float RouteFollow::_curveDist() const {
+  return _curveDriveLeg == (int8_t)_i ? fmaxf(0.0f, (_eff - _curveEff0) * lmkMPerEff) : 0.0f;
 }
 
 bool RouteFollow::_pathSteer() const {
@@ -669,11 +676,18 @@ void RouteFollow::_step(const Sensors& s, const WallFollow& wf) {
       // path mode: turn towards the taught path 1 m ahead, else to the leg direction
       const float e = ((imuCurveLegs >> _i) & 1u) ? _wrap(_curveYaw(s, 0) - ry)   // 27.11.: IMU curve leg
                     : _pathSteer() ? _pathErrRad() * RAD_TO_DEG : _wrap(L.ref - ry);
-      if (fabsf(e) < turnDoneDeg && !_pivoting) { _state = DRIVE; return; }
+      // 27.11. (log_069, leg 8 at the pole): 7 deg off (inside turnDoneDeg) but the pivot flag stayed set -> stood 50 s
+      // in TURN. Curve legs: inside turnDoneDeg = turned; the curve's own heading control does the rest.
+      const bool curveLeg = (imuCurveLegs >> _i) & 1u;
+      if (fabsf(e) < turnDoneDeg && (!_pivoting || curveLeg)) {
+        if (curveLeg) { _pivoting = false; _hc = 0; _curveDriveLeg = (int8_t)_i; _curveEff0 = _eff; }
+        _state = DRIVE; return;
+      }
       // 06.11.: never hang in TURN (heading not reachable, blocked, ramp foot): after turnTimeoutMs drive the
       // leg anyway - the rolling heading hold keeps correcting, the leg-end checks run again
       if (now - _stateMs > (turnTactics ? turnTacticTimeoutMs : turnTimeoutMs)) {
         _state = DRIVE; _pivoting = false; _hc = 0; _noTurnEff = _eff; _stateMs = now;
+        if (((imuCurveLegs >> _i) & 1u) && _curveDriveLeg != (int8_t)_i) { _curveDriveLeg = (int8_t)_i; _curveEff0 = _eff; }
         snprintf(_msg, sizeof(_msg), "leg %u: turn time-out, driving on", (unsigned)(_i + 1));
         Serial.printf("[route] leg %u: turn not finished after %u ms (err %.0f deg) -> drive\n", (unsigned)(_i + 1), (unsigned)turnTimeoutMs, e);
         return;
@@ -854,6 +868,7 @@ void RouteFollow::_step(const Sensors& s, const WallFollow& wf) {
       _yawDesF = _wrap(_yawDesF + 0.5f * _wrap(yawDes - _yawDesF));
       if ((imuCurveLegs >> _i) & 1u) {   // 27.11.: IMU curve leg - taught direction at the distance driven, gyro only
         _peInit = false;
+        if (_curveDriveLeg != (int8_t)_i) { _curveDriveLeg = (int8_t)_i; _curveEff0 = _eff; }
         _drive(_wrap(_curveYaw(s, curveLeadM) - ry), v, true);
       } else if (_pathSteer()) {   // pure pursuit on the taught path; 06.11.: light low-pass (scan-match pose noise)
         const float pe = _pathErrRad() * RAD_TO_DEG;   // (clamped around the IMU ref on HOLD legs)
@@ -906,7 +921,7 @@ void RouteFollow::_step(const Sensors& s, const WallFollow& wf) {
       // 27.11.: IMU curve leg ends at the taught path length (distance driven), not on the LiDAR pose / end scan
       if ((imuCurveLegs >> _i) & 1u) {
         const float len = (_lpOn && _lp.leg() == _i) ? _lp.sEnd() : L.effort;
-        if (_eff * lmkMPerEff >= len - 0.1f) _nextLeg(s, "IMU curve: taught length");
+        if (_curveDist() >= len - 0.1f) _nextLeg(s, "IMU curve: taught length");
         return;
       }
       // v3 (11.11., log_031): the LOCKED path localizer says the rover is clearly short of the taught path end ->
