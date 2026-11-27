@@ -125,6 +125,7 @@ public:
   uint32_t lmkPathLegs = 0;
   uint32_t lmkNeedEndLegs = 0;
   uint32_t restartLegs = 0;
+  uint32_t parkLegs = (1u << 9);   // 27.11.: leg 10 = parking turn (180 deg, right, in steps) - see _nextLeg
   // 26.11. (logs 042 / 055): the pitch/roll "level" was taken only at start(): box 10 read +0.5 deg at building B and
   // -2.5..-3 deg on the flat ground after ramp 3 -> 27-58 % of legs 9-10 counted as "on a slope" and the landmark legs
   // ignored the wall ahead. Now a new level is taken in every leg: median of the first relevelS of DRIVE, only if steady
