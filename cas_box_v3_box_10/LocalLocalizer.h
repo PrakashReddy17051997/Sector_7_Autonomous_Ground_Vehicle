@@ -28,6 +28,15 @@ public:
   static const uint8_t kN = 90;
   float kSpeed = 1.0f;          // m/s per forward command (LiDAR-measured, log_012)
   float accept = 0.35f, acceptReloc = 0.45f;
+  // 27.11. (logs 066 / 067, leg 8 round the pole to the K corner, match score 0.5-0.6): relocations threw the pose
+  // 1.2-2.9 m along the path (066: 2 m FORWARD -> the rover turned right for the K corner 2 m early, leg 9 started
+  // in the wrong place and ended in the open area; 067: 1.2 m back, then 2.9 m forward - it only worked by luck).
+  // A relocation may move the pose at most relocMaxJumpM / relocMaxDthDeg from where gyro + distance put it,
+  // unless the match has been lost for relocFreeLost scans (then it is really lost and any pose may be taken) or the
+  // far pose matches clearly better than the current one (score + relocBetter: replay of log_064 leg 2, open area -
+  // a real 2 m correction, 0.90 against ~0.4 at the dead-reckoned pose).
+  float relocMaxJumpM = 1.0f, relocMaxDthDeg = 20.0f, relocBetter = 0.25f;
+  uint8_t relocFreeLost = 12;
   float relocOffM = 1.0f;       // further off the taught path -> relocate onto it (v4: RouteFollow widens it during a detour)
   float thPrior = 40.0f;        // score per rad^2 of heading change against the gyro (2 deg = 0.05, 4 deg = 0.2)
 

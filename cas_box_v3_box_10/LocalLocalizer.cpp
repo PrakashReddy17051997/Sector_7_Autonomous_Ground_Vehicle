@@ -248,7 +248,9 @@ void LocalLocalizer::_relocate(const float* px, const float* py, int n) {
                             pri[k].x, pri[k].y, pri[k].th, 0.3f, 0.3f);
     if (b2.sc > best.sc) best = b2;
   }
-  if (best.sc > acceptReloc) {
+  const float jx = best.x - _x, jy = best.y - _y;
+  const bool near = jx * jx + jy * jy <= relocMaxJumpM * relocMaxJumpM && fabsf(wrapPi(best.th - _th)) <= relocMaxDthDeg * kDeg;
+  if (best.sc > acceptReloc && (near || _lost >= relocFreeLost || best.sc >= scoreAt(px, py, n, _x, _y, _th) + relocBetter)) {   // 27.11.: no big jumps while still tracking
     _x = best.x; _y = best.y; _th = best.th;
     _ok = true;
     _score = best.sc;
