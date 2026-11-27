@@ -154,6 +154,7 @@ DisplayManager disp;  // small OLED on the box
 Countdown countdown;  // 18.11.
 CalibrationManager cal;   // 19.11.
 SelfCheck selfCheck;      // 24.11.
+uint32_t cdHeldMs = 0;    // 27.11.: start held by the pre-start check (0 = not held)
 // 19.11.: lidar.cal estimate (Dev page) - running mean + spread, the "Save LiDAR calibration" button uses them
 float calEst = NAN, calM2 = 0; uint16_t calN = 0;
 volatile uint8_t calReq = 0;   // 1 save LiDAR, 2 reset LiDAR, 3 reset trim (done in loop, not in the web task)
@@ -248,11 +249,16 @@ void updateOled() {
   }
   String ip = WiFi.softAPIP().toString();
   String r = rover.connected() ? "Rover " + String(rover.voltage(), 1) + "V" : "Rover: search";
+  if (cdHeldMs) { disp.show("START HELD", selfCheck.blockWhy(), "fix it / 2x tap = stop"); return; }   // 27.11.
   if (radio.quiet()) { disp.show(boxSsid, "MISSION: phone off", "2x tap = Wi-Fi on"); return; }
   // 18.11. (course rule): line 1 = countdown state; ACTIVE -> seconds to the start on line 2
   char c1[24], c2[24];
   countdown.line(c1, sizeof(c1));
-  if (countdown.active()) { countdown.line2(c2, sizeof(c2)); disp.show(c1, c2, boxSsid); return; }
+  if (countdown.active()) {   // 27.11.: line 3 = pre-start check instead of the Wi-Fi name
+    countdown.line2(c2, sizeof(c2));
+    disp.show(c1, c2, selfCheck.startOk() ? "check OK" : selfCheck.blockWhy());
+    return;
+  }
   disp.show(c1, ip.c_str(), r.c_str());
 }
 
@@ -408,13 +414,36 @@ void loop() {
     static bool cdWas = false;
     const bool cdNow = countdown.active();
     if (cdNow && !cdWas) { selfCheck.reset(); sensors.usOffMask = US_OFF_MASK; }
-    if (cdNow) selfCheck.sample(sensors);
+    if (cdNow || cdHeldMs) selfCheck.sample(sensors, rover.voltage());
     cdWas = cdNow;
   }
-  if (countdown.poll(sensors) && !mission.active()) {
-    sensors.usOffMask = US_OFF_MASK | selfCheck.badMask();
-    Serial.println("[selfcheck] " + selfCheck.json() + " -> US off mask " + String(sensors.usOffMask, BIN));
-    mission.requestRoute(countdown.speed, countdown.leg);   // 24.11.: + start leg
+  // 27.11.: at 0 s the pre-start check must pass (LiDAR not blind, IMU ready) - else the start is HELD and goes as soon
+  // as it passes, at most SelfCheck::kHoldMs; a double tap cancels a held start
+  {
+    static uint16_t tapsAtHold = 0;
+    if (countdown.poll(sensors) && !mission.active()) {
+      cdHeldMs = millis() ? millis() : 1; tapsAtHold = sensors.imu().doubleTaps();
+    }
+    if (cdHeldMs) {
+      if (mission.active()) {
+        cdHeldMs = 0;
+      } else if (sensors.imu().doubleTaps() != tapsAtHold) {
+        Serial.println("[selfcheck] held start cancelled (double tap)"); cdHeldMs = 0;
+      } else if (selfCheck.startOk()) {
+        const uint32_t late = millis() - cdHeldMs;
+        cdHeldMs = 0;
+        sensors.usOffMask = US_OFF_MASK | selfCheck.badMask();
+        Serial.println("[selfcheck] " + selfCheck.json() + " -> US off mask " + String(sensors.usOffMask, BIN) +
+                       (late > 500 ? ", started " + String(late / 1000.0f, 1) + " s late" : String("")));
+        mission.requestRoute(countdown.speed, countdown.leg);   // 24.11.: + start leg
+      } else if (millis() - cdHeldMs > SelfCheck::kHoldMs) {
+        Serial.printf("[selfcheck] start CANCELLED after %lu s: %s\n", (unsigned long)(SelfCheck::kHoldMs / 1000), selfCheck.blockWhy());
+        cdHeldMs = 0;
+      } else {
+        static uint32_t lastMsg = 0;
+        if (millis() - lastMsg > 2000) { lastMsg = millis(); Serial.printf("[selfcheck] start HELD: %s\n", selfCheck.blockWhy()); }
+      }
+    }
   }
   mission.pollRequests(sensors, wall, nav);
   if (mission.active()) { if (t90.on) turn90Stop("mission started"); mission.steer(sensors, wall, nav, padL, padR, age, l, r); }

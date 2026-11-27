@@ -58,7 +58,7 @@ async function st(){try{
  try{const r=await (await get('/radio.json')).json();rq=r.quiet?'phone OFF in mission':'phone stays on';}catch(e){}
  let sc='';
  try{const c=await (await get('/selfcheck.json')).json();
-  if(j.active) sc='  |  self-check '+c.s+' s: '+(c.bad?('US OFF: '+c.bad):'ultrasonics OK')+(c.warn?(' | '+c.warn):'');}catch(e){}
+  if(j.active) sc='  |  self-check '+c.s+' s: '+(c.bad?('US OFF: '+c.bad):'ultrasonics OK')+(c.warn?(' | '+c.warn):'')+(c.ok===false?(' | START BLOCKED: '+c.block):' | check OK');}catch(e){}
  $('cdMore').textContent='log: '+lg+'  |  '+rq+'  |  at 0 s: '+(j.leg>0?('from leg '+(j.leg+1)):'whole route')+', speed '+spd().toFixed(2)+sc;
 }catch(e){}}
 setInterval(st,1000);st();
