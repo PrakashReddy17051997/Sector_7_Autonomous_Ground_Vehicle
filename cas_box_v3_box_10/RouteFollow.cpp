@@ -111,6 +111,7 @@ bool RouteFollow::start(const Sensors& s, const WallFollow& wf, uint8_t i, float
   _state = (aligned && fabsf(_alignDeg) > turnDoneDeg) ? TURN : DRIVE;
   _startTurn = _state == TURN; _startRounds = 0; _stepTgt = NAN; _settleMs = 0; _netM = 0;
   _restartCheck = false; _needEndPaused = false; _lvDone = true; _lvN = 0;   // 26.11.
+  _parkMs = 0;   // 27.11.
   _stateMs = _lastStep = millis();
   if (_state == TURN) snprintf(_msg, sizeof(_msg), "start: facing %.0f deg off - turning", _alignDeg);
   else snprintf(_msg, sizeof(_msg), "leg %u: %s", (unsigned)(i + 1), L.name);
@@ -397,6 +398,33 @@ bool RouteFollow::_wallFilter(float& d, float& wy) {
   wy = _wrap(wy + a[_wN / 2]);
   d = b[_wN / 2];
   return true;
+}
+
+// 27.11. (log_063: after the park turn the operator reversed 6.1 m by hand, straight, to LiDAR rear 36 cm / back US
+// 25 cm = the parking spot). Reverse at parkRevV, slower within 60 cm, hold the heading the turn ended with; stop when
+// the LiDAR behind (168-192 deg, median) <= parkRearCm + parkStopLeadCm (what the 2 s soft stop still rolls) or the back
+// ultrasonic <= parkBackUsCm, or after parkMaxBackM / 60 s. SafetyGuard (back US < 20 cm) stays as the last net.
+void RouteFollow::_parkReverse(const Sensors& s, float ry, uint32_t now) {
+  if (_parkMs == 0) { _parkMs = now ? now : 1; _parkOdo0 = _odo; _parkYaw = ry; }
+  float v[8]; uint8_t n = 0;
+  for (int a = 168; a <= 192; a += 4) { const uint16_t cm = s.lidarCm((uint8_t)(a / 4)); if (cm > 15 && n < 8) v[n++] = cm; }
+  for (uint8_t x = 1; x < n; x++) for (uint8_t q = x; q > 0 && v[q - 1] > v[q]; q--) { const float t = v[q]; v[q] = v[q - 1]; v[q - 1] = t; }
+  const float rear = n ? v[n / 2] : 999.0f;
+  const int ub = s.usCm(3);
+  const bool usNear = ub > 2 && ub < Sensors::kUsMaxCm && ub <= parkBackUsCm;
+  const float back = _parkOdo0 - _odo;                       // driven backward (effort, ~m)
+  const char* why = rear <= parkRearCm + parkStopLeadCm ? "parked (wall behind)" : usNear ? "parked (back US)" :
+                    back >= parkMaxBackM ? "parked (max distance)" : now - _parkMs > 60000 ? "parked (time)" : nullptr;
+  if (why) {
+    Serial.printf("[route] %s: LiDAR rear %.0f cm, back US %d cm, reversed %.1f\n", why, rear, ub, back);
+    _l = _r = 0; _parkMs = 0;
+    _nextLeg(s, why);
+    return;
+  }
+  const float vb = rear < parkRearCm + 60.0f ? parkRevSlowV : parkRevV;
+  const float diff = _clamp(0.01f * _wrap(_parkYaw - ry), -0.05f, 0.05f);   // + = turn left (right wheels faster)
+  _l = -vb - diff; _r = -vb + diff;
+  snprintf(_msg, sizeof(_msg), "parking: reversing, wall behind %.0f cm", rear);
 }
 
 void RouteFollow::_nextLeg(const Sensors& s, const char* how) {
@@ -690,6 +718,8 @@ void RouteFollow::_step(const Sensors& s, const WallFollow& wf) {
     }
 
     case DRIVE: {
+      // 27.11. (log_063): PARK leg - after the 180 deg turn reverse straight until the wall behind is at parkRearCm
+      if ((parkLegs >> _i) & 1u) { _parkReverse(s, ry, now); return; }
       // ---- obstacle ahead
       for (uint8_t i = 0; i < Sensors::kLidarPoints; i++) _scan[i] = s.lidarCm(i);
       const float fr = _front(s);
@@ -1853,7 +1883,9 @@ bool RouteFollow::_obsDetect(const Sensors& s, const Leg& L, uint32_t now, float
   const float trig = obsStopCm + obsLeadCm;
   if (f >= obsSlowCm) { _lowN = 0; return false; }
   // a leg that ends at a wall ahead ends there (as before)
-  if (L.end == END_FRONT && _eff >= 0.3f * L.effort && f < trig) { _nextLeg(s, "wall ahead reached"); return true; }
+  // 27.11. (log_063, leg 9 uphill at the end of K): the front ultrasonic alone read 22 cm (floor echo, pitch +3.5) while
+  // the LiDAR saw nothing for 9 m -> leg 9 ended 5 m early. A wall that ends a leg must be seen by the LiDAR too.
+  if (L.end == END_FRONT && _eff >= 0.3f * L.effort && f < trig && lidF < trig + 15.0f) { _nextLeg(s, "wall ahead reached"); return true; }
   // a wall of the TAUGHT map (path locked, the LiDAR sees it, nothing new there): the teaching run drove there (corners,
   // narrow passages) -> the old rule: only closer than lpStopM in the rover-wide corridor
   const float c = _corridor(s, 0, obsHalfWM, 2.5f);

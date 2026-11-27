@@ -76,6 +76,10 @@ void Sensors::_snapshotLidar() {
     const int deg = ((bin + _lidarOffsetDeg) % 360 + 360) % 360;
     const uint8_t i = deg / degPerPoint;
     const uint16_t cm = mm / 10;
+    if (_selfFrontCm > 0 && cm < _selfFrontCm + _selfHalfCm) {   // 27.11.: self-mask (only near returns cost a sin/cos)
+      const float a = deg * 0.01745329f, x = cm * cosf(a), y = cm * sinf(a);
+      if (x > 0 && x < _selfFrontCm && fabsf(y) < _selfHalfCm) continue;
+    }
     if (_lidarCm[i] == 0 || cm < _lidarCm[i]) _lidarCm[i] = cm;
   }
 }

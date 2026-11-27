@@ -19,6 +19,9 @@ public:
   // Starts I2C and all sensors. lidarOffsetDeg rotates the LiDAR view so that point 0 is the box
   // front (90 for the box as mounted).
   void begin(int lidarOffsetDeg);
+  // 27.11. (log_063: 25 of 29 LiDAR hard stops from 1-3 points at x ~22 cm, |y| < 9 cm while the front US saw nothing -
+  // a part of the rover in the beam when it pitches): drop returns with 0 < x < frontCm and |y| < halfCm (cm from the LiDAR).
+  void setLidarSelfMask(int frontCm, int halfCm) { _selfFrontCm = frontCm; _selfHalfCm = halfCm; }
   void update();               // call every loop pass (core 1)
   String toJson() const;       // snapshot for the web page (~650 bytes)
 
@@ -64,6 +67,8 @@ private:
   ImuManager _imu;
 
   int _lidarOffsetDeg = 0;
+
+  int _selfFrontCm = 0, _selfHalfCm = 0;   // 27.11.: LiDAR self-mask (0 = off)
   uint32_t _lastSnapMs = 0, _lastImuTryMs = 0, _lastPpsMs = 0, _lastPackets = 0;
 
   // snapshot values (loop() only)

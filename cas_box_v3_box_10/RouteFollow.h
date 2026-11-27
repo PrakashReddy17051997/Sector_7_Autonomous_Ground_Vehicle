@@ -126,6 +126,10 @@ public:
   uint32_t lmkNeedEndLegs = 0;
   uint32_t restartLegs = 0;
   uint32_t parkLegs = (1u << 9);   // 27.11.: leg 10 = parking turn (180 deg, right, in steps) - see _nextLeg
+  // 27.11. (log_063): then reverse to the wall behind (_parkReverse): stop at LiDAR rear <= parkRearCm + parkStopLeadCm
+  // (the 2 s soft stop rolls ~0.2 m) or back US <= parkBackUsCm; speeds (0.15 does not move rover 7 on the ground)
+  float parkRearCm = 38.0f, parkStopLeadCm = 20.0f, parkRevV = 0.25f, parkRevSlowV = 0.20f, parkMaxBackM = 8.0f;
+  int parkBackUsCm = 27;
   // 26.11. (logs 042 / 055): the pitch/roll "level" was taken only at start(): box 10 read +0.5 deg at building B and
   // -2.5..-3 deg on the flat ground after ramp 3 -> 27-58 % of legs 9-10 counted as "on a slope" and the landmark legs
   // ignored the wall ahead. Now a new level is taken in every leg: median of the first relevelS of DRIVE, only if steady
@@ -683,6 +687,9 @@ private:
   LmkSlot _lmkSlot[16];
   uint8_t _lmkN = 0;
   float _lmkLen = 0;
+  uint32_t _parkMs = 0;              // 27.11.: park reverse running since (0 = not)
+  float _parkOdo0 = 0, _parkYaw = 0;
+  void _parkReverse(const Sensors& s, float ry, uint32_t now);
   bool _restartCheck = false;         // 26.11.: this TURN is a restart check (restartLegs), not the route start
   bool _needEndPaused = false;        // 26.11.: lmkNeedEndLegs: paused once on a doubtful distance end -> next time take it
   float _lvP[8], _lvR[8];             // 26.11.: pitch / roll samples for the per-leg level

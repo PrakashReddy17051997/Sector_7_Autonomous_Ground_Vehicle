@@ -144,6 +144,11 @@ const float OBS_SIDE_KEEP_CM = 35;   // gap to the obstacle while going round (s
 // MEASURE these two on the rover (tape from the LiDAR's centre): they turn LiDAR distances into body distances
 const float LIDAR_NOSE_CM = 12.5f;   // LiDAR centre -> front bumper (v6: 25 cm box, LiDAR in the middle)
 const float LIDAR_SIDE_CM = 12.5f;   // LiDAR centre -> left / right side of the body
+// 27.11. (log_063): the LiDAR sees a part of the rover ~22 cm ahead when it pitches -> 25 of 29 hard stops. Returns with
+// x < LIDAR_SELF_FRONT_CM and |y| < LIDAR_SELF_HALF_CM (from the LiDAR centre) are dropped (0 = off). The bumper zone
+// is still covered by the front ultrasonic and the 35 cm soft obstacle stop. MEASURE what sticks out there on the rover.
+const int LIDAR_SELF_FRONT_CM = 28;
+const int LIDAR_SELF_HALF_CM = 10;
 const float LIDAR_REAR_CM = 12.5f;   // LiDAR centre -> rear bumper
 
 // ---- objects ---------------------------------------------------------------------------------
@@ -360,6 +365,7 @@ void setup() {
   Serial.println("[boot] 4 log + web ready, starting sensors (LiDAR motor) in 0.5 s");
   delay(500);                        // let the supply recover from the Wi-Fi start first
   sensors.begin(cal.lidarDeg());   // 19.11.: saved LiDAR angle (default LIDAR_OFFSET_DEG)
+  sensors.setLidarSelfMask(LIDAR_SELF_FRONT_CM, LIDAR_SELF_HALF_CM);   // 27.11.
   sensors.usOffMask = US_OFF_MASK;   // 24.11. box 10
   Serial.println("[boot] 5 sensors started");
   rover.begin(100);  // sends the current drive command every 100 ms
