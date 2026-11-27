@@ -203,6 +203,9 @@ public:
   float rollBackCmd = 0.2f;   // rolling backwards (obstacle ahead)
   float lookAheadM = 1.5f;    // wall legs: aim at the set distance this far ahead
   float maxApproachDeg = 15.0f;
+  // 27.11. (log_064, leg 9): the K wall was 3.2-4.7 m away (taught 2.1 m) - beyond the old 3 m wall-fit range, so
+  // the leg only held the IMU heading and ran 6 deg off the wall into the sand. Route wall legs fit up to this.
+  uint16_t wallMaxCm = 450;
   float wallTolDeg = 20.0f;   // a wall line counts only if it runs within this of the leg direction
   float anchorGain = 0.05f;   // heading correction from the wall, per scan
   float avoidEnterM = 0.70f;  // corridor ahead shorter -> obstacle handling
@@ -371,7 +374,11 @@ public:
   float gapLookM = 3.5f;          // LiDAR look-ahead of the lanes
   float gapNeedM = 3.0f;          // a heading counts as free when its strip is free this far (from the LiDAR):
                                   // early - a rolling curve of the rover turns only a few deg per second
-  float gapMaxDevDeg = 60;        // furthest it looks off the route direction
+  float gapMaxDevDeg = 60;
+  // 27.11. (log_064 leg 1: detours went right towards the drop): equal bends left / right used to go RIGHT (the
+  // search ran from the right). Now the side with more LiDAR room (beside the route, > 0.2 m more) is preferred by
+  // gapSideBiasDeg; Leg::noRight = never right of the route (edges / drops the LiDAR cannot see).
+  float gapSideBiasDeg = 8.0f;        // furthest it looks off the route direction
   float gapWideMaxDeg = 25;       // a 35 cm-gap heading beats a narrow gap only within this of the route
   float obsGapPastM = 0.8f;
   float gapLaneMaxM = 1.2f;       // narrow-gap lanes: sideways search range       // narrow-gap mode: the heading's strip must be free this far past the obstacle
@@ -501,6 +508,7 @@ private:
   void _nextLeg(const Sensors& s, const char* how);
   bool _wallNow(const Sensors& s, const WallFollow& wf, int8_t side, float& d, float& dirYaw, float& rms, uint8_t& pts) const;
   float _corridor(const Sensors& s, float phiDeg, float half, float look) const;
+  bool _wallAcross(const Sensors& s, float maxM) const;   // 27.11.: a wall ACROSS the way (not one foot / post)
   float _front(const Sensors& s) const;
   float _scanChangeCm(const Sensors& s) const;
   void _drive(float e, float v, bool fwd);      // sets the target; _control drives
@@ -612,6 +620,7 @@ private:
   void _avoidCurve(const Sensors& s, const Leg& L, float ry, uint32_t now);
   bool _gapOk = false, _gapDeviating = false;
   float _wallBias = 0;   // 19.11.: wall keep-off (deg, + = left), set by _obsDetect each DRIVE step
+  int8_t _gapPref = 0;   // 27.11.: preferred detour side this step (+1 left, -1 right, 0 none)
   float _gapDevDeg = 0, _gapLat = 0, _gapOdo = 0, _gapRevOdo = 0, _gapRecEff = 0;
   int8_t _gapRevDir = 0;
   uint8_t _gapRec = 0;

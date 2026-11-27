@@ -22,7 +22,7 @@
 
 class SafetyGuard {
 public:
-  enum Reason : uint8_t { OK = 0, TILT = 1, FRONT_US = 2, FRONT_ANGLED = 3, FRONT_LIDAR = 4, BACK_US = 5, SIDE_US = 6 };
+  enum Reason : uint8_t { OK = 0, TILT = 1, FRONT_US = 2, FRONT_ANGLED = 3, FRONT_LIDAR = 4, BACK_US = 5, SIDE_US = 6, US_BLIND = 7 };
 
   struct Config {
     float maxRollDeg = 12, maxPitchDeg = 15;  // stop above these
@@ -48,6 +48,14 @@ public:
     float lidarMarginCm = 2.0f;               // strip = body width + this on each side (24.11.: 5 -> 2, log_052)
     int backStopCm = 20;                      // back ultrasonic
     int sideStopCm = 15;                      // 19.11.: left / right ultrasonic (driving forward)
+    // 27.11. LiDAR-BLIND net: things below / above the LiDAR plane (kerb, low post, sand edge) only the ultrasonics see.
+    // Any ultrasonic (front, left, right, back) closer than usBlindStopCm for usBlindHoldMs IN A ROW stops - no LiDAR
+    // agreement needed. Front / left / right stop driving forward, back stops reversing. The hold drops single false
+    // echoes (logs 062-064: readings < 20 cm lasting >= 3 log records: 0-1 per sensor and run). Front: never more
+    // than frontStopCm (the sketch lowers that to 10 cm on the ramp - floor echo). 0 = off. Switched-off sensors
+    // (usOffMask, self-check) read "nothing".
+    int usBlindStopCm = 20;
+    uint16_t usBlindHoldMs = 600;
   };
 
   Config cfg;
@@ -63,6 +71,14 @@ public:
       else if (ar < cfg.levelDeg && ap < cfg.levelDeg) _tilted = false;
     } else {
       _tilted = false;  // no IMU, no tilt information
+    }
+
+    bool ub[4];   // 27.11.: ultrasonic i < usBlindStopCm for usBlindHoldMs
+    for (uint8_t i = 0; i < 4; i++) {
+      const int u = s.usCm(i), lim = (i == 0 && cfg.frontStopCm < cfg.usBlindStopCm) ? cfg.frontStopCm : cfg.usBlindStopCm;
+      const bool near = lim > 0 && _valid(u) && u < lim;
+      if (!near) _ubMs[i] = 0; else if (_ubMs[i] == 0) _ubMs[i] = millis() | 1u;
+      ub[i] = near && millis() - _ubMs[i] >= cfg.usBlindHoldMs;
     }
 
     if (_tilted) {
@@ -81,12 +97,14 @@ public:
       else if (_lidarBodyStop(s)) why = FRONT_LIDAR;                   // 24.11.: body-wide strip, from the bumper
       else if (_lidarFrontMinCm(s) < cfg.lidarStopCm) why = FRONT_LIDAR;
       else if (_sideNear(s, 1) || _sideNear(s, 2)) why = SIDE_US;   // 19.11.
+      else if (ub[0] || ub[1] || ub[2]) why = US_BLIND;              // 27.11.: LiDAR-blind net
       if (why != OK) v = 0;
     } else if (v < 0) {
       // 06.11. (log_026-028: the back ultrasonic reads a constant 16 cm, the LiDAR sees nothing behind for
       // > 1.4 m -> every back-up was blocked): it only counts if the LiDAR rear sector agrees (or has no data)
       const uint16_t lr = _lidarRearMinCm(s);
       if (_valid(s.usCm(3)) && s.usCm(3) < cfg.backStopCm && (lr == 0xFFFF || lr < cfg.backStopCm + 25)) { why = BACK_US; v = 0; }
+      else if (ub[3]) { why = US_BLIND; v = 0; }                     // 27.11.: back ultrasonic alone, held
     }
 
     if (why != OK) {
@@ -106,6 +124,7 @@ public:
       case FRONT_LIDAR: return "STOP: LiDAR front";
       case BACK_US: return "STOP: back ultrasonic";
       case SIDE_US: return "STOP: side ultrasonic";
+      case US_BLIND: return "STOP: ultrasonic < 20 cm (LiDAR blind)";
       default: return "?";
     }
   }
@@ -174,5 +193,6 @@ private:
 
   bool _tilted = false;
   uint8_t _lbN = 0;     // 24.11.: checks in a row with a point in the body strip
+  uint32_t _ubMs[4] = {0, 0, 0, 0};   // 27.11.: since when ultrasonic i reads < usBlindStopCm (0 = not)
   uint32_t _usMs = 0;   // since when the front ultrasonic reads close (0 = not close)
 };

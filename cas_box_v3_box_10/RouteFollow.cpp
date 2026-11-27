@@ -11,7 +11,7 @@
 // teaching run, deg, + = left), dSet m, effort = forward path length / 1 m per effort (GEO, from the LiDAR
 // trajectory: not the driver's commands), ref of HOLD legs = direction start -> end, gate, end GPS = zone only
 static const RouteFollow::Leg kRoute[] = {
-  {RouteFollow::HOLD,  1, RouteFollow::END_EFFORT, 0.00f,     1.6f, 0.00f,  20.8f, 0.75f, 0.0000000, 0.0000000, 1, 0, 0, "M1-M15 heading: corner right"},  // 1: t 2-321 s, GPS 0.0 m
+  {RouteFollow::HOLD,  1, RouteFollow::END_EFFORT, 0.00f,     1.6f, 0.00f,  20.8f, 0.75f, 0.0000000, 0.0000000, 1, 1, 0, "M1-M15 heading: corner right"},   // 27.11.: noRight - drop on the right (canyon)  // 1: t 2-321 s, GPS 0.0 m
   {RouteFollow::HOLD,  1, RouteFollow::END_EFFORT, 0.00f,   -84.1f, 0.00f,  33.5f, 0.75f, 0.0000000, 0.0000000, 1, 0, 0, "M15-M34 heading: ramp ends right"},  // 2: t 337-721 s, GPS 0.0 m
   {RouteFollow::WALL, -1, RouteFollow::END_LOST, 0.00f,  -182.3f, 1.49f,   5.9f, 0.75f, 0.0000000, 0.0000000, 1, 0, 0, "M34-M38 L wall: wall ends ahead"},  // 3: t 747-825 s, GPS 0.0 m
   {RouteFollow::WALL, -1, RouteFollow::END_FRONT, 1.10f,   -94.1f, 1.07f,   4.2f, 0.90f, 0.0000000, 0.0000000, 1, 0, 0, "M38-M42 L wall: wall starts ahead"},  // 4: t 839-915 s, GPS 0.0 m
@@ -218,7 +218,7 @@ void RouteFollow::steer(const Sensors& s, const WallFollow& wf, float& l, float&
 
 bool RouteFollow::_wallNow(const Sensors& s, const WallFollow& wf, int8_t side, float& d, float& dirYaw,
                            float& rms, uint8_t& pts) const {
-  const WallFollow::Wall w = wf.measure(s, side < 0 ? WallFollow::LEFT : WallFollow::RIGHT, nullptr);
+  const WallFollow::Wall w = wf.measure(s, side < 0 ? WallFollow::LEFT : WallFollow::RIGHT, nullptr, wallMaxCm);   // 27.11.: log_064
   if (!w.ok || w.points < 6) return false;
   const float ry = routeYaw(s);
   dirYaw = _wrap(side < 0 ? ry + w.angleDeg : ry - w.angleDeg);  // direction of the wall line
@@ -244,6 +244,20 @@ float RouteFollow::_corridor(const Sensors& s, float phiDeg, float half, float l
 }
 
 float RouteFollow::_front(const Sensors& s) const { return _corridor(s, 0, 0.35f, 1.5f); }
+
+// 27.11. (log_064: leg 9 ended 8 m early on ONE LiDAR point 21 cm off the front-right corner - a foot / plant)
+// A wall that ends a leg runs ACROSS the way: >= 3 points up to maxM ahead within +-0.6 m, spread >= 0.30 m sideways.
+bool RouteFollow::_wallAcross(const Sensors& s, float maxM) const {
+  float lo = 9, hi = -9; uint8_t n = 0;
+  for (uint8_t i = 0; i < Sensors::kLidarPoints; i++) {
+    const uint16_t cm = s.lidarCm(i);
+    if (cm < 25) continue;
+    const float a = (i * 4.0f + 2.0f) * DEG_TO_RAD, rr = cm / 100.0f, al = rr * cosf(a), lt = rr * sinf(a);
+    if (al <= 0 || al > maxM || fabsf(lt) >= 0.6f) continue;
+    n++; lo = fminf(lo, lt); hi = fmaxf(hi, lt);
+  }
+  return n >= 3 && hi - lo >= 0.30f;
+}
 
 // Median change (cm) of the LiDAR points between now and the reference scan of 2 s ago.
 float RouteFollow::_scanChangeCm(const Sensors& s) const {
@@ -758,7 +772,7 @@ void RouteFollow::_step(const Sensors& s, const WallFollow& wf) {
       const float hs = lpk ? lpStopM : hardStopM;
       const float frStop = lpk ? _corridor(s, 0, 0.18f, 1.5f) : fr;
       if (!ramp && frStop < hs) {
-        if (L.end == END_FRONT && _eff >= 0.3f * L.effort) { _nextLeg(s, "wall ahead reached"); return; }
+        if (L.end == END_FRONT && _eff >= L.gate * L.effort && _wallAcross(s, hs + 0.4f)) { _nextLeg(s, "wall ahead reached"); return; }
         _lowN = 1;   // with this pass: 2 -> obstacle handling now
       }
       bool blocked = lpk ? frStop < hs : fr < avoidEnterM;
@@ -860,7 +874,7 @@ void RouteFollow::_step(const Sensors& s, const WallFollow& wf) {
           if (_frN >= 4) {  // median of the last 4 scans
             float a[4] = {_fr[0], _fr[1], _fr[2], _fr[3]};
             for (uint8_t x = 1; x < 4; x++) for (uint8_t y = x; y > 0 && a[y - 1] > a[y]; y--) { const float t = a[y]; a[y] = a[y - 1]; a[y - 1] = t; }
-            end = gate && 0.5f * (a[1] + a[2]) < L.endArg;
+            end = gate && 0.5f * (a[1] + a[2]) < L.endArg && _wallAcross(s, L.endArg + 0.3f);   // 27.11.
           }
           break;
         }
@@ -1885,7 +1899,11 @@ bool RouteFollow::_obsDetect(const Sensors& s, const Leg& L, uint32_t now, float
   // a leg that ends at a wall ahead ends there (as before)
   // 27.11. (log_063, leg 9 uphill at the end of K): the front ultrasonic alone read 22 cm (floor echo, pitch +3.5) while
   // the LiDAR saw nothing for 9 m -> leg 9 ended 5 m early. A wall that ends a leg must be seen by the LiDAR too.
-  if (L.end == END_FRONT && _eff >= 0.3f * L.effort && f < trig && lidF < trig + 15.0f) { _nextLeg(s, "wall ahead reached"); return true; }
+  // 27.11. (log_064, leg 9 at 15 of 25 m): one LiDAR point 21 cm off the front-right corner (a foot or a plant) ended
+  // it - the park then ran in the middle of the K walkway. The wall must run across the way (_wallAcross) and the
+  // leg must be past its gate, like the normal END_FRONT end.
+  if (L.end == END_FRONT && _eff >= L.gate * L.effort && f < trig && lidF < trig + 15.0f &&
+      _wallAcross(s, (lidF + lidarNoseCm) / 100.0f + 0.3f)) { _nextLeg(s, "wall ahead reached"); return true; }
   // a wall of the TAUGHT map (path locked, the LiDAR sees it, nothing new there): the teaching run drove there (corners,
   // narrow passages) -> the old rule: only closer than lpStopM in the rover-wide corridor
   const float c = _corridor(s, 0, obsHalfWM, 2.5f);
@@ -2242,7 +2260,9 @@ bool RouteFollow::_gapCentre(float relDeg, float look, float& lo) const {
     if (!fr && run != -1000) {
       const float c = (run + i - 1) * 0.01f;                       // middle of the run (2 cm steps)
       float score = fabsf(c);
+      if (_cur().noRight && c < -0.04f) { run = -1000; continue; }   // 27.11.: never a lane right of the route
       if (_gapDevDeg != 0 && c * _gapDevDeg < 0 && fabsf(c) > 0.04f) score += 0.5f;   // keep the side it chose
+      else if (_gapDevDeg == 0 && _gapPref != 0 && c * _gapPref < 0 && fabsf(c) > 0.04f) score += 0.15f;   // 27.11.
       if (score < best) { best = score; lo = c; found = true; }
       run = -1000;
     }
@@ -2276,8 +2296,10 @@ bool RouteFollow::_gapPick(float e, float half, float need, float& out) const {
     const float cand = e + d;
     if (fabsf(cand) > gapMaxDevDeg) continue;                      // never more than that off the nose
     if (_gapFree(cand, half, gapLookM) < need) continue;
+    if (_cur().noRight && d < -0.1f) continue;                     // 27.11.: edge / drop on the right: never bend right
     float cost = fabsf(d);
     if (_gapDevDeg != 0 && d * _gapDevDeg < 0) cost += 15.0f;     // the other side than before: only if clearly better
+    else if (_gapDevDeg == 0 && _gapPref != 0 && d * _gapPref < 0) cost += gapSideBiasDeg;   // 27.11.: the roomier side
     if (cost < best) { best = cost; out = cand; found = true; }
   }
   return found;
@@ -2334,6 +2356,10 @@ void RouteFollow::_gapSteer(float& e, float& v) {
   } else { _gapRefOn = false; _gapLaneOn = false; }
   float out = want;
   bool dev = false;
+  {  // 27.11.: which side has more room beside the route (75 deg off it, 2 m) - ties go there, not always right
+    const float rmL = _gapFree(want + 75.0f, half2, 2.0f), rmR = _gapFree(want - 75.0f, half2, 2.0f);
+    _gapPref = _cur().noRight ? 1 : (rmL > rmR + 0.2f ? 1 : (rmR > rmL + 0.2f ? -1 : 0));
+  }
   if (_gapFree(want, half1, gapLookM) < need) {                    // the way on is not free with the 35 cm gap
     // the thing ahead is part of the TAUGHT map (path locked, nothing new): the teaching run drove there - no bend
     const float fNear = _gapFree(want, half2, gapLookM);

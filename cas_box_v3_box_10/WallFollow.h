@@ -70,7 +70,8 @@ public:
   struct Wall { bool ok; float distM, angleDeg, rmsM; uint8_t points; };
   const Wall& lastWall() const { return _wall; }
   // One wall fit. prior = last wall line (tracking) or nullptr (fresh search).
-  Wall measure(const Sensors& s, Side side, const Wall* prior) const;
+  // maxCm: farthest LiDAR point used (300 = old fixed limit; RouteFollow uses wallMaxCm for its wall legs)
+  Wall measure(const Sensors& s, Side side, const Wall* prior, uint16_t maxCm = 300) const;
   float corridorM(const Sensors& s, float phiDeg) const;  // free length ahead in direction phi
 
 private:

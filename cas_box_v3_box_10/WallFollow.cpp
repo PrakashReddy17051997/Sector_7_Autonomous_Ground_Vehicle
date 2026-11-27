@@ -38,7 +38,7 @@ static bool fitLine(const float* x, const float* y, int n, float& mx, float& my,
 
 // One wall fit on one side. "Side frame": x forward, y towards the wall side (so the wall is at
 // y > 0 for both sides). Angle < 0 means the nose points towards the wall.
-WallFollow::Wall WallFollow::measure(const Sensors& s, Side side, const Wall* prior) const {
+WallFollow::Wall WallFollow::measure(const Sensors& s, Side side, const Wall* prior, uint16_t maxCm) const {
   Wall w = {false, 0, 0, 0, 0};
   if (!s.lidarOk()) return w;
   const int n = Sensors::kLidarPoints;
@@ -48,7 +48,7 @@ WallFollow::Wall WallFollow::measure(const Sensors& s, Side side, const Wall* pr
   int m = 0;
   for (int i = 0; i < n; i++) {
     const uint16_t cm = s.lidarCm(i);
-    if (cm < 20 || cm > 300) continue;  // 0 = no return; beyond 3 m too sparse outdoors
+    if (cm < 20 || cm > maxCm) continue;  // 0 = no return; beyond 3 m too sparse outdoors (route wall legs: wallMaxCm)
     const float a = (i * degPer + degPer / 2);
     float o = fabsf(fmodf(a - center + 540.0f, 360.0f) - 180.0f);  // angle from side direction
     if (o > 60.0f) continue;
