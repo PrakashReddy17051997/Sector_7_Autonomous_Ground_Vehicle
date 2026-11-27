@@ -535,7 +535,10 @@ void RouteFollow::_step(const Sensors& s, const WallFollow& wf) {
     // distance, so the rover skipped the corner at building C. Now the path end counts only after
     // pathEndMinFrac of the taught effort, and never on yaw-only legs (LiDAR position unreliable there).
     const bool yawLeg = (yawLegs >> _i) & 1u;
-    if (_lp.atEnd() && !yawLeg && !_lmkOn && _eff >= pathEndMinFrac * L.effort && (_state == DRIVE || _state == TURN)) {
+    // 27.11. (log_065 leg 4: a relocation threw the pose 1.5 m forward, "path end" at 2.0 of 4.2 -> legs 5-8 ran ~3 m
+    // ahead of the rover): with a weak match (score < minPathScore) the path end needs pathEndWeakFrac of the distance
+    const float endFrac = _lp.score() >= minPathScore ? pathEndMinFrac : pathEndWeakFrac;
+    if (_lp.atEnd() && !yawLeg && !_lmkOn && _eff >= endFrac * L.effort && (_state == DRIVE || _state == TURN)) {
       _nextLeg(s, "path end"); return;
     }
   }
@@ -1890,7 +1893,10 @@ bool RouteFollow::_obsDetect(const Sensors& s, const Leg& L, uint32_t now, float
   // the detour tried to go round the ramp. There only the front ultrasonic starts a detour (the SafetyGuard stays).
   if ((rampLegs >> _i) & 1u) {
     const int u0 = s.usCm(0);
-    f = (u0 > 2 && u0 < Sensors::kUsMaxCm) ? (float)u0 : 999.0f;
+    // 27.11. (logs 064 + 065, leg 2 at the campus store, pitch 2-3 deg): the front ultrasonic read a steady 39-41 cm
+    // (floor echo at the slope) with the LiDAR free for > 1.5 m -> "obstacle", detours, PAUSE twice per run. Alone it
+    // counts only below obsUsAloneCm (25 cm), like on the flat; the SafetyGuard (ramp: 10 cm, LiDAR-blind net) stays.
+    f = (u0 > 2 && u0 < Sensors::kUsMaxCm && u0 < obsUsAloneCm) ? (float)u0 : 999.0f;
     agree = false;
   }
   _obsFront = f;
@@ -2342,6 +2348,11 @@ void RouteFollow::_gapSteer(float& e, float& v) {
   // something in the way: bend relative to the ROUTE direction, not to e - the pursuit's e swings back towards the
   // line as soon as the rover leaves it and dragged the lane bend along (sim, 40 cm gap: e +21 -> it curved into the box)
   // the reference is the absolute heading the route asked for when the obstacle was first seen (frozen until free)
+  // 27.11. (log_065 leg 3, the corner after ramp 2): the reference froze at the heading of the first look (path error
+  // -14 deg) while the taught path turned 90 deg right; the pursuit asked -40 ... -85 deg, the bend kept ~-8 and drove
+  // into the left wall (stop, PAUSE, localizer lost). Locked on the taught path the reference follows the path every
+  // step until a real bend starts.
+  if (pathLocked() && _lp.score() >= avMinScore && !_gapDeviating) _gapRefOn = false;
   if (!clearAhead || _gapDeviating) {
     if (!_gapRefOn) {
       _gapRefOn = true; _gapRefYaw = _wrap(_stepRy + e);

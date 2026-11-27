@@ -149,7 +149,10 @@ public:
   // within +-holdTolDeg of the leg's IMU heading (ref = direction start -> end), and only with a match
   // score >= minPathScore - otherwise the rover holds the IMU heading (relative yaw).
   float holdTolDeg = 15.0f, minPathScore = 0.5f;
-  float pathEndMinFrac = 0.5f;   // "path end" ends a leg only after this share of the taught effort
+  // 27.11. (log_065): 0.5 -> 0.7 (logs 062-064: legs ended at 0.82-2.4 of their taught effort); a weak match (score
+  // < minPathScore) needs pathEndWeakFrac - a relocation jump made "path end" at 0.48 and the route ran ahead
+  float pathEndMinFrac = 0.7f;   // "path end" ends a leg only after this share of the taught effort
+  float pathEndWeakFrac = 0.9f;
   // 06.11. (log_028: the rover hit a pole 10 m into ramp leg 2 - the whole 33 m leg had no obstacle
   // handling): ramp mode only while the rover is REALLY on the slope - pitch off the start level by
   // more than slopeDeg, and slopeHoldMs after that. Before / after the slope the obstacle handling is on.
