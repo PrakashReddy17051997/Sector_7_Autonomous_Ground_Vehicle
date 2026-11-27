@@ -24,6 +24,21 @@ bool LocalLocalizer::hasMap() const { return kLegs > 0; }
 uint8_t LocalLocalizer::legs() const { return kLegs; }
 float LocalLocalizer::sEnd() const { return kLeg[_leg].sEnd; }
 
+// 27.11. (IMU curve legs): taught path direction at s (m from the leg start), over +-0.5 m (2 points of 0.25 m)
+float LocalLocalizer::tangentAt(float s) const {
+  const Leg& L = kLeg[_leg];
+  if (L.nPath < 2) return 0;
+  int k = (int)(s / kStep + 0.5f);
+  if (k < 0) k = 0;
+  if (k > (int)L.nPath - 1) k = L.nPath - 1;
+  int a = k - 2, b = k + 2;
+  if (a < 0) a = 0;
+  if (b > (int)L.nPath - 1) b = L.nPath - 1;
+  if (a == b) { if (a > 0) a--; else b++; }
+  return atan2f((float)(L.path[2 * b + 1] - L.path[2 * a + 1]), (float)(L.path[2 * b] - L.path[2 * a]));
+}
+float LocalLocalizer::nextThOf(uint8_t leg) const { return leg < kLegs ? kLeg[leg].nextTh : 0.0f; }
+
 void LocalLocalizer::begin(uint8_t leg) {
   _leg = leg < kLegs ? leg : 0;
   _x = _y = _th = 0;

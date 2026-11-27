@@ -60,6 +60,8 @@ public:
   float th() const { return _th; }        // rad
   float s() const { return _pi * 0.25f; } // m along the taught path of this leg
   float sEnd() const;
+  float tangentAt(float s) const;           // 27.11.: direction of the taught path of this leg at s m (rad, leg frame)
+  float nextThOf(uint8_t leg) const;        // 27.11.: next leg's frame vs this leg's frame (rad)
   float off() const { return _off; }      // m from the taught path
   float score() const { return _score; }
   bool ok() const { return _ok; }         // this scan matched

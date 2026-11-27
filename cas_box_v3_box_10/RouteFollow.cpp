@@ -84,6 +84,7 @@ bool RouteFollow::start(const Sensors& s, const WallFollow& wf, uint8_t i, float
     _off = _wrap(L.ref - s.yawDeg());  // rover points along the leg
   }
   _i = i;
+  _curveLeg = -1;   // 27.11.: IMU curve base is taken fresh
   _loc.enabled = RouteLocalizer::mapLegs() == kN;  // map from another teaching run: do not use it
   if (!_loc.enabled)
     Serial.printf("[route] RouteMap.h has %u legs, kRoute %u - LiDAR end match OFF (old rule). "
@@ -172,8 +173,31 @@ float RouteFollow::_pathErrRad() const {
 
 // Steer on the LiDAR-localised taught path? Not on yaw-only legs (open area / ramp, see yawLegs):
 // there the rover holds the taught heading (route yaw = relative gyro yaw + offset) instead.
+// 27.11.: IMU curve legs (see imuCurveLegs): target route yaw = frame base + taught path direction at the distance
+// driven + aheadM. The base is set once per leg: from the previous curve leg (taught frame change), else from the
+// LiDAR pose (rover heading in this leg's frame), else from the leg ref.
+float RouteFollow::_curveYaw(const Sensors& s, float aheadM) {
+  if (_curveLeg != (int8_t)_i) {
+    const bool chain = _curveLeg >= 0 && _curveLeg == (int8_t)_i - 1 && _lpOn;
+    if (chain) {
+      _curveBase = _wrap(_curveBase + _lp.nextThOf(_i - 1) * RAD_TO_DEG);
+      Serial.printf("[route] leg %u: IMU curve, frame from leg %u (%+.1f deg)\n", (unsigned)(_i + 1), (unsigned)_i, _lp.nextThOf(_i - 1) * RAD_TO_DEG);
+    } else if (_lpOn && _lp.leg() == _i && _lp.score() >= curveMinScore) {
+      _curveBase = _wrap(routeYaw(s) - _lp.th() * RAD_TO_DEG);
+      Serial.printf("[route] leg %u: IMU curve, frame from the LiDAR (score %.2f, rover %+.1f deg in the leg)\n",
+                    (unsigned)(_i + 1), _lp.score(), _lp.th() * RAD_TO_DEG);
+    } else {
+      _curveBase = _cur().ref;
+      Serial.printf("[route] leg %u: IMU curve, no LiDAR lock - frame from the leg ref\n", (unsigned)(_i + 1));
+    }
+    _curveLeg = (int8_t)_i;
+  }
+  const float sNow = _eff * lmkMPerEff + aheadM;
+  return _wrap(_curveBase + (_lpOn && _lp.leg() == _i ? _lp.tangentAt(sNow) * RAD_TO_DEG : 0.0f));
+}
+
 bool RouteFollow::_pathSteer() const {
-  return pathLocked() && !_lmkOn && !((yawLegs >> _i) & 1u) && (_cur().kind != HOLD || _lp.score() >= minPathScore);
+  return pathLocked() && !_lmkOn && !((yawLegs >> _i) & 1u) && !((imuCurveLegs >> _i) & 1u) && (_cur().kind != HOLD || _lp.score() >= minPathScore);
 }
 
 // 24.11. (log_052, ramp turn: side boards of the taught route stopped the rover as obstacles): true when the localizer
@@ -521,7 +545,7 @@ void RouteFollow::_step(const Sensors& s, const WallFollow& wf) {
     // distance, so the rover skipped the corner at building C. Now the path end counts only after
     // pathEndMinFrac of the taught effort, and never on yaw-only legs (LiDAR position unreliable there).
     const bool yawLeg = (yawLegs >> _i) & 1u;
-    if (_lp.atEnd() && !yawLeg && !_lmkOn && _eff >= pathEndMinFrac * L.effort && (_state == DRIVE || _state == TURN)) {
+    if (_lp.atEnd() && !yawLeg && !((imuCurveLegs >> _i) & 1u) && !_lmkOn && _eff >= pathEndMinFrac * L.effort && (_state == DRIVE || _state == TURN)) {
       _nextLeg(s, "path end"); return;
     }
   }
@@ -643,7 +667,8 @@ void RouteFollow::_step(const Sensors& s, const WallFollow& wf) {
     case TURN: {
       if (_startTurn) { _startTurnStep(s, ry, now); return; }   // v3: start alignment (90 deg steps + re-check)
       // path mode: turn towards the taught path 1 m ahead, else to the leg direction
-      const float e = _pathSteer() ? _pathErrRad() * RAD_TO_DEG : _wrap(L.ref - ry);
+      const float e = ((imuCurveLegs >> _i) & 1u) ? _wrap(_curveYaw(s, 0) - ry)   // 27.11.: IMU curve leg
+                    : _pathSteer() ? _pathErrRad() * RAD_TO_DEG : _wrap(L.ref - ry);
       if (fabsf(e) < turnDoneDeg && !_pivoting) { _state = DRIVE; return; }
       // 06.11.: never hang in TURN (heading not reachable, blocked, ramp foot): after turnTimeoutMs drive the
       // leg anyway - the rolling heading hold keeps correcting, the leg-end checks run again
@@ -827,7 +852,10 @@ void RouteFollow::_step(const Sensors& s, const WallFollow& wf) {
       // smooth the target: the wall angle from one 90-point scan jitters by a few degrees
       if (!_yawDesInit) { _yawDesF = yawDes; _yawDesInit = true; }
       _yawDesF = _wrap(_yawDesF + 0.5f * _wrap(yawDes - _yawDesF));
-      if (_pathSteer()) {   // pure pursuit on the taught path; 06.11.: light low-pass (scan-match pose noise)
+      if ((imuCurveLegs >> _i) & 1u) {   // 27.11.: IMU curve leg - taught direction at the distance driven, gyro only
+        _peInit = false;
+        _drive(_wrap(_curveYaw(s, curveLeadM) - ry), v, true);
+      } else if (_pathSteer()) {   // pure pursuit on the taught path; 06.11.: light low-pass (scan-match pose noise)
         const float pe = _pathErrRad() * RAD_TO_DEG;   // (clamped around the IMU ref on HOLD legs)
         if (!_peInit) { _peF = pe; _peInit = true; }
         _peF = _wrap(_peF + 0.6f * _wrap(pe - _peF));
@@ -875,6 +903,12 @@ void RouteFollow::_step(const Sensors& s, const WallFollow& wf) {
       }
       // ---- LiDAR end match (RouteLocalizer): compare the scan with the taught end scan of the leg
       _loc.endStep(_scan, L.effort > 0 ? _eff / L.effort : 0, gate);
+      // 27.11.: IMU curve leg ends at the taught path length (distance driven), not on the LiDAR pose / end scan
+      if ((imuCurveLegs >> _i) & 1u) {
+        const float len = (_lpOn && _lp.leg() == _i) ? _lp.sEnd() : L.effort;
+        if (_eff * lmkMPerEff >= len - 0.1f) _nextLeg(s, "IMU curve: taught length");
+        return;
+      }
       // v3 (11.11., log_031): the LOCKED path localizer says the rover is clearly short of the taught path end ->
       // no leg end by effort / end scan / scan dip. log_031 leg 6 ended on effort 17.0 (avoid moves and slip count as
       // effort) while the localizer (score 0.6-0.9) said 10.5 of 17 m - leg 8 then turned 6 m early into the steps.

@@ -141,6 +141,16 @@ public:
   float relevelS = 1.5f, relevelSpreadDeg = 1.5f;
   uint32_t yawLegs = 0;   // 26.11.: none (log_027 leg 15 is gone); the legs follow the path when the LiDAR match holds
   bool onYawLeg() const { return active() && ((yawLegs >> _i) & 1u); }
+  // 27.11. IMU CURVE legs (bit i = leg i+1; logs 066 / 068: the LiDAR match round the pole is weak, wrong relocations
+  // sent the rover into the K corner 2 m early). On these legs the rover does not steer on the LiDAR pose: the
+  // target heading = the taught path's direction at the distance driven (LocalPath.h, s = effort * lmkMPerEff,
+  // curveLeadM ahead), turned into route yaw ONCE when the first curve leg starts (rover heading in the leg frame
+  // from the LiDAR match if its score >= curveMinScore, else the leg ref). The next curve leg continues from it with
+  // the taught frame change (no LiDAR). The leg ends at the taught path length. Obstacle stops / curve avoid,
+  // ultrasonic and the SafetyGuard stay on. 0 = off.
+  uint32_t imuCurveLegs = (1u << 6) | (1u << 7);   // legs 7 (ramp end -> before the pole) and 8 (arc to the K corner)
+  float curveLeadM = 0.2f, curveMinScore = 0.6f;   // lead small: distance from effort may run ahead (slip)
+  bool onCurveLeg() const { return active() && ((imuCurveLegs >> _i) & 1u); }
   uint32_t turnTimeoutMs = 12000;  // TURN between legs: after this long drive the leg anyway (no hang)
   float noTurnAfterTimeoutEff = 1.5f;  // 06.11. (log_029 deadlock): after a turn time-out drive at least this
                                        // far before the path may ask for a turn on the spot again
@@ -527,6 +537,9 @@ private:
   uint32_t _slopeMs = 0;              // last time the pitch was off the start level (ramp mode)
   float _Ld = 1.0f, _ey = 0, _xteI = 0, _peF = 0;   // look-ahead (m), cross-track (m, + = left), integral (deg), filtered pursuit error
   bool _peInit = false;
+  int8_t _curveLeg = -1;    // 27.11.: leg the curve base belongs to
+  float _curveBase = 0;     // 27.11.: route yaw of that leg frame's x axis
+  float _curveYaw(const Sensors& s, float aheadM);
   float _noTurnEff = -99;             // effort at the last turn time-out
   float _tgtYaw = 0, _tgtV = 0, _yawDesF = 0, _rate = 0, _prevYaw = 0;
   uint32_t _ctrlMs = 0, _pivotMs = 0, _unstallUntil = 0, _arcMs = 0;
